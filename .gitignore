@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+wheels/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 本地环境变量与密钥
+.env
+.env.*.local
+
+# 常见工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/tests/
+/test_texts/
+/scripts/
+uv.lock
+pyproject.toml
+workspace/*
+!workspace/README.md
