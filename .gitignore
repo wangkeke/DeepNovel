@@ -22,6 +22,6 @@ venv/
 /test_texts/
 /scripts/
 uv.lock
-pyproject.toml
 workspace/*
 !workspace/README.md
+*.zip
