@@ -22,7 +22,8 @@ from tools.blueprint_store import load_blueprint, search_blueprints
 from knowledge.genre_matcher import match_genre
 from knowledge.genre_dict import GENRE_DICT
 from config import COMPATIBILITY_RULES, COMPATIBILITY_HIGH, COMPATIBILITY_MID, DB_PATH
-from memory.db import load_chapters
+from memory.db import load_chapters_count
+from utils.v42_flow import shallow_world_archive
 
 console = Console()
 logger = logging.getLogger("deepnovel.blueprint_load")
@@ -148,9 +149,9 @@ async def _try_resume_from_db(project_id: str) -> dict | None:
         except (KeyError, IndexError, TypeError, ValueError):
             auto_mode = False
         try:
-            max_chapters = int(row["max_chapters"] or 0)
+            max_auto_events = int(row["max_chapters"] or 0)
         except (KeyError, IndexError, TypeError, ValueError):
-            max_chapters = 0
+            max_auto_events = 0
         try:
             user_write_rules = (row["user_write_rules"] or "").strip()
         except (KeyError, IndexError, AttributeError):
@@ -185,6 +186,12 @@ async def _try_resume_from_db(project_id: str) -> dict | None:
                         current_event_chain_pos = int(ec.get("chain_pos", 0) or 0)
         except (KeyError, TypeError, json.JSONDecodeError):
             pass
+
+        ne_from_ws = ""
+        wa_resume: dict = {}
+        if isinstance(world_setting, dict):
+            ne_from_ws = str(world_setting.get("narrative_era") or "").strip()
+            wa_resume = shallow_world_archive(world_setting)
 
         # 取当前批次未完成的节点（按 seq 升序）
         cursor2 = await conn.execute(
@@ -230,11 +237,13 @@ async def _try_resume_from_db(project_id: str) -> dict | None:
             "bible":                   bible,
             "world_setting":           world_setting,
             "world_setting_confirmed": bool(world_setting),
+            "world_archive":           wa_resume,
+            "narrative_era":            ne_from_ws,
             "protagonist_name":        protagonist_name,
             "platform_style":          platform_style,
             "last_action_intent":       last_action_intent,
             "auto_mode":               auto_mode,
-            "max_chapters":            max_chapters,
+            "max_auto_events":         max_auto_events,
             "story_path":              story_path,
             "current_node_index":      0,
             "auto_retry_count":        0,
@@ -266,11 +275,13 @@ async def _try_resume_from_db(project_id: str) -> dict | None:
             "bible":                   bible,
             "world_setting":           world_setting,
             "world_setting_confirmed": bool(world_setting),
+            "world_archive":           wa_resume,
+            "narrative_era":            ne_from_ws,
             "protagonist_name":        protagonist_name,
             "platform_style":          platform_style,
             "last_action_intent":       last_action_intent,
             "auto_mode":               auto_mode,
-            "max_chapters":            max_chapters,
+            "max_auto_events":         max_auto_events,
             "story_path":              [],
             "current_node_index":      0,
             "auto_retry_count":        0,
@@ -315,15 +326,17 @@ async def blueprint_load_node(state: CreationState, writer: StreamWriter) -> dic
         }
 
     # ── 续传模式：项目已存在于 DB ──────────────────────────────────────────────
-    if project_id:
+    # 沙盒/压测可设 _sandbox_skip_db_resume，避免复用 project_id 时把章节行数误写入
+    # global_settled_event_count，导致 max_events 与雷达尚未运行就提前退出。
+    if project_id and not state.get("_sandbox_skip_db_resume"):
         resume_patch = await _try_resume_from_db(project_id)
         if resume_patch is not None:
-            # 续传且 state 中无已完成章节时，从 DB 加载（供 write_node prev_chapter_section）
-            if not state.get("completed_chapters"):
-                records = await load_chapters(project_id)
-                resume_patch["completed_chapters"] = [
-                    r["content"] for r in records if r.get("content")
-                ]
+            # 续传：仅用 DB 正文行数粗估已产出规模；精确事件数以 checkpoint 为准
+            resume_patch["global_settled_event_count"] = await load_chapters_count(project_id)
+            resume_patch.setdefault("volume_start_event_count", 0)
+            resume_patch.setdefault("completed_events_summary", [])
+            resume_patch.setdefault("auto_target", "book")
+            resume_patch.setdefault("max_auto_events", 0)
             # 续传时也做题材匹配，确保 path_gen 有词典可用
             matched_genres = match_genre(genre_request)
             genre_dicts    = [GENRE_DICT[g] for g in matched_genres if g in GENRE_DICT]

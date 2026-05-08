@@ -28,6 +28,14 @@ from prompts.creation.world_tick import (
     WORLD_TICK_SYSTEM,
     WORLD_TICK_USER_TEMPLATE,
 )
+from prompts.creation.narrative_memory import OFFSCREEN_TICK_SYSTEM, OFFSCREEN_TICK_USER
+from utils.narrative_memory import (
+    ensure_memory_streams,
+    format_character_faction_goals_for_tick,
+    format_character_personality_for_tick,
+    format_long_term_snippet_for_tick,
+)
+from memory.entity_db import upsert_entity_card, get_entities_by_names
 
 logger = logging.getLogger("deepnovel.world_tick")
 
@@ -114,6 +122,111 @@ def _validate_world_tick(tick: dict) -> tuple[bool, str]:
     if not (tick.get("protagonist_need") or "").strip():
         return False, "protagonist_need 为空"
     return True, ""
+
+
+async def _merge_entity_card_for_tick_prompt(project_id: str, name: str, card: dict) -> dict:
+    """合并 entity_cards.data_json 到角色 dict（保留 state 中 short/long 叙事流不被空覆盖）。"""
+    c = ensure_memory_streams(dict(card))
+    st_keep = list(c.get("short_term_stream") or [])
+    lt_keep = list(c.get("long_term_stream") or [])
+    if not project_id:
+        return c
+    try:
+        rows = await get_entities_by_names(project_id, [name])
+        for row in rows:
+            rname = str(row.get("name") or "")
+            aliases = row.get("aliases") if isinstance(row.get("aliases"), list) else []
+            if rname != name and name not in aliases:
+                continue
+            d = row.get("data") if isinstance(row.get("data"), dict) else {}
+            for k, v in d.items():
+                if k in ("short_term_stream", "long_term_stream"):
+                    continue
+                if v in (None, "", [], {}):
+                    continue
+                old = c.get(k)
+                if old in (None, "", [], {}) or (
+                    isinstance(v, str) and isinstance(old, str) and len(str(v)) > len(str(old))
+                ):
+                    c[k] = v
+            break
+    except Exception as exc:
+        logger.warning("[world_tick] 读取 entity_cards 失败 (%s): %s", name, exc)
+    c["short_term_stream"] = st_keep
+    c["long_term_stream"] = lt_keep
+    return c
+
+
+async def _patch_bible_offscreen_long_term_from_tick(
+    state: CreationState,
+    tick: dict,
+) -> dict | None:
+    """补丁 I §三-B：将 World Tick 独立议程压入对应角色的 long_term_stream（第一人称后台句）。"""
+    if not isinstance(tick, dict) or tick.get("_fallback"):
+        return None
+    project_id = str(state.get("project_id") or "").strip()
+    if not project_id:
+        return None
+    prot = str(state.get("protagonist_name") or "").strip()
+    bible = dict(state.get("bible") or {})
+    chars: dict[str, dict] = {
+        str(k): ensure_memory_streams(dict(v))
+        for k, v in (bible.get("characters") or {}).items()
+        if isinstance(v, dict) and str(k).strip()
+    }
+    agendas = tick.get("independent_agendas") or []
+    if not isinstance(agendas, list):
+        return None
+    current_idx = int(state.get("current_node_index", 0) or 0)
+    seq = current_idx + 1
+    changed = False
+    for ag in agendas[:3]:
+        if not isinstance(ag, dict):
+            continue
+        nm = str(ag.get("character_or_faction") or "").strip()
+        if not nm or nm == prot:
+            continue
+        base_card = ensure_memory_streams(dict(chars.get(nm, {})))
+        merged = await _merge_entity_card_for_tick_prompt(project_id, nm, base_card)
+        traits_txt = format_character_personality_for_tick(merged)
+        goals_txt = format_character_faction_goals_for_tick(merged, nm, state)
+        lt_txt = format_long_term_snippet_for_tick(merged, 5)
+        user_txt = OFFSCREEN_TICK_USER.format(
+            character_name=nm,
+            character_personality_and_traits=traits_txt,
+            character_faction_and_goals=goals_txt,
+            long_term_stream=lt_txt,
+            current_pressure=str(ag.get("current_pressure") or ""),
+            current_opportunity=str(ag.get("current_opportunity") or ""),
+            natural_action=str(ag.get("natural_action") or ""),
+            action_ripple=str(ag.get("action_ripple") or ""),
+        )
+        line = ""
+        try:
+            raw = await call_llm_json(OFFSCREEN_TICK_SYSTEM, user_txt, max_tokens=520)
+            if isinstance(raw, dict):
+                line = str(raw.get("backroom_line") or "").strip()
+        except Exception as exc:
+            logger.warning("[world_tick] offscreen narrative line 失败 (%s): %s", nm, exc)
+        if not line:
+            continue
+        if nm not in chars:
+            chars[nm] = ensure_memory_streams({"standard_name": nm, "name": nm})
+        card = chars[nm]
+        lt = list(card.get("long_term_stream") or [])
+        lt.append(line)
+        card["long_term_stream"] = lt[-80:]
+        chars[nm] = card
+        changed = True
+        try:
+            await upsert_entity_card(
+                project_id, "character", nm, {"long_term_stream": [line]}, seq=seq,
+            )
+        except Exception as exc:
+            logger.warning("[world_tick] long_term_stream 入库失败 (%s): %s", nm, exc)
+    if not changed:
+        return None
+    return {**bible, "characters": chars}
 
 
 # ── 主节点 ────────────────────────────────────────────────────────────────────
@@ -203,7 +316,12 @@ async def world_tick_node(state: CreationState, writer: StreamWriter) -> Command
         f"need={(tick.get('protagonist_need') or '')[:30]}"
     )
 
+    tick_bible = await _patch_bible_offscreen_long_term_from_tick(state, tick)
+    upd: dict = {"current_world_tick": tick}
+    if tick_bible is not None:
+        upd["bible"] = tick_bible
+
     return Command(
-        update={"current_world_tick": tick},
+        update=upd,
         goto="protagonist_collision",
     )

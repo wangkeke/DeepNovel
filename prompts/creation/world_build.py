@@ -1,11 +1,19 @@
 from prompts.common.deepnovel_constitution import DEEPNOVEL_CONSTITUTION
+from prompts.common.realism_doctrine import WORLD_AND_PROTAGONIST_REALISM_DOCTRINE
 
-WORLD_BUILD_SYSTEM = DEEPNOVEL_CONSTITUTION + "\n\n" + """你是一个世界观设计师，同时也是资源稀缺与灰度博弈的架构师。
+WORLD_BUILD_SYSTEM = (
+    DEEPNOVEL_CONSTITUTION
+    + "\n\n"
+    + WORLD_AND_PROTAGONIST_REALISM_DOCTRINE
+    + "\n\n"
+    + """你是一个世界观设计师，同时也是资源稀缺与灰度博弈的架构师。
 根据已确认的宏观构思，生成一份世界设定卡。
 世界设定卡是全书的"宪法"——一旦确认，全书不再变动。
-冲突须能从【有限资源（权、钱、修为、情感、领土等）】与【势力制衡】中推导，善恶是利益投影而非固定标签。
+冲突须能从【有限资源（权、钱、自身实力、情感、领土等）】与【势力制衡】中推导，善恶是利益投影而非固定标签。
 若用户消息中包含「冰山反推·世界结构基底」JSON：须**继承**其中的核心规则、权力层级与关键事实，在此基础上精炼与扩写；禁止无因果地颠覆已给出的结构性设定。
+须给出独立字段 narrative_era（字符串）：与 user 消息中的「叙事时代与语体锚点」一致且可执行；须与文后「时代语料隔离法则」自洽（禁止古今语料混搭；不做穷举禁词，由模型按时代肌理自行约束词界）。
 只返回 JSON，不加任何前言。"""
+)
 
 WORLD_BUILD_USER_TEMPLATE = """## 题材与目标平台（全书固定；势力舞台须与读者赛道一致）
 
@@ -21,13 +29,16 @@ WORLD_BUILD_USER_TEMPLATE = """## 题材与目标平台（全书固定；势力�
 
 {iceberg_world_baseline}
 
+{narrative_era_section}
 ## 任务
 
 根据宏观构思，生成一份精简的世界设定卡。
 要求：
-- basic_rules 须点明**何种稀缺资源**导致阶层倾轧或规则压迫
+- basic_rules 须点明**何种稀缺资源**导致阶层倾轧或规则压迫；并落实 System 中「四、宏大叙事与人性驱动」：人驱万物、时代结构性冲突、多诉求交织，**禁止**道具中心主义（不可把全书矛盾写成「举世争夺单一物件」）
 - power_structure 至少 3～5 条，每条写清**利益冲突或互相钳制**（非单极碾压空话）
 - gray_zone_ecology：缝隙中的掮客、灰产、破戒者等**至少 1～2 条**，便于借力打力
+- narrative_era 须与上节锚点一致，写清时代类别、具体锚点与词汇/认知边界（抽象描述即可，勿堆禁词表）
+- 各字段正文须遵守 System 文末「时代语料隔离法则」
 - 每条尽量简短，设定卡不是百科全书
 
 返回 JSON：
@@ -47,7 +58,8 @@ WORLD_BUILD_USER_TEMPLATE = """## 题材与目标平台（全书固定；势力�
   ],
   "unique_settings": [
     "区别于同类小说的特有元素（一句话，让读者觉得新鲜）"
-  ]
+  ],
+  "narrative_era": "与上节锚点一致：古代|近代|现代|架空 + 具体锚点 + 禁用词/机制（40-120字）"
 }}"""
 
 # 续传/修改时用于展示当前设定供 LLM 参考
@@ -57,6 +69,7 @@ WORLD_BUILD_REVISE_USER_TEMPLATE = """## 题材与目标平台（全书固定）
 
 {platform_macro_hint}
 
+{narrative_era_section}
 ## 已确认的宏观构思
 
 {synopsis_text}
@@ -76,6 +89,7 @@ WORLD_BUILD_REVISE_USER_TEMPLATE = """## 题材与目标平台（全书固定）
 ## 任务
 
 根据用户意见修改世界设定卡，保持未提及的部分不变。
+除非用户意见明确要求改动时代或语体，须保持 narrative_era 与上节「叙事时代与语体锚点」一致。
 返回完整的修改后 JSON（格式同上）。"""
 
 # 主角人物卡：终端展示用短文案（实际交互见 __main__ 自由输入）
@@ -85,7 +99,12 @@ PROTAGONIST_FREE_INPUT_HINT = """用一句话或几个关键词描述你心中�
 
 PROTAGONIST_INPUT_QUESTIONS = [PROTAGONIST_FREE_INPUT_HINT]
 
-PROTAGONIST_CARD_FROM_USER_SYSTEM = DEEPNOVEL_CONSTITUTION + "\n\n" + """你是精通人格心理学的角色设计师（与《DeepNovel 重构文档》PROMPT 3「灵魂层·主角卡」一致）。
+PROTAGONIST_CARD_FROM_USER_SYSTEM = (
+    DEEPNOVEL_CONSTITUTION
+    + "\n\n"
+    + WORLD_AND_PROTAGONIST_REALISM_DOCTRINE
+    + "\n\n"
+    + """你是精通人格心理学的角色设计师（与《DeepNovel 重构文档》PROMPT 3「灵魂层·主角卡」一致）。
 角色不是属性面板的集合，而是有独立意志的生命体。
 须结合用户消息中的 world_archive 与 synopsis：先理解资源格局与势力生态，再写主角的初始处境与性格表现。
 
@@ -95,7 +114,13 @@ PROTAGONIST_CARD_FROM_USER_SYSTEM = DEEPNOVEL_CONSTITUTION + "\n\n" + """你是�
 【叙事字段】appearance / persona / signature_habits / reverse_scale 必须给出；reverse_scale 为绝对逆鳞，禁止空字符串。
 【引擎对接】除文档型 mental_core 外，必须另给 mental_core_panel：五键 0～100 整数
 （intelligence, eq, meticulousness, emotional_capacity, forbearance），须与 mental_core 文字一致，禁止全 50 敷衍。
-先天属性允许内在矛盾；成熟度高不等于没有情感；逆鳞被触时仍可大悲，但可转入缜密行动。"""
+先天属性允许内在矛盾；成熟度高不等于没有情感；逆鳞被触时仍可大悲，但可转入缜密行动。
+
+【补丁 J · independent_agenda】
+`independent_agenda` 不是「终极目标清单句」（禁止只写「我要查明真相/我要活命」这类空泛一句话）。
+须写清：**无外部事件时主角也会主动去做的事**——日常/高频行动轨迹、内在驱动（不是谁逼他，是他自己认为该做）、与谋生与世界接触方式如何衔接（开店接客、跑现场、接短单、下墓、审计进场等，随题材）。
+错误：只写目的不写行动；或与气质不符的硬造派单组织依赖。"""
+)
 
 PROTAGONIST_CARD_FROM_USER_TEMPLATE = """## 题材与目标平台（必须遵守；决定主角性别与叙事切入）
 
@@ -157,7 +182,7 @@ PROTAGONIST_CARD_FROM_USER_TEMPLATE = """## 题材与目标平台（必须遵守
     "growth_trajectory": "在哪些事件后可能发生跃迁"
   }},
   "world_position": "基于 world_archive：当前圈层与资源",
-  "independent_agenda": "无外部事件时主角自己的生活目标与行动计划",
+  "independent_agenda": "无外部事件时：主角日常主动做什么（具体行动轨迹+内在驱动+与谋生/圈层接触的衔接，禁止仅写终极目标一句）",
   "faction_relationship": {{}},
   "core_motif": "叙事用核心底色（80-200字，可从欲求/恐惧提炼）",
   "background_summary": "出身与关键经历（50-120字）",

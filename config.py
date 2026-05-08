@@ -28,8 +28,8 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/beta"
 LLM_MODEL = "deepseek-chat"
 LLM_MODEL_WRITE = "deepseek-chat"
-LLM_MAX_TOKENS = 8192
-LLM_MAX_RETRIES = 3
+LLM_MAX_TOKENS: int = int(os.environ.get("LLM_MAX_TOKENS", "8000"))
+LLM_MAX_RETRIES: int = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 
 # ─── utils/llm.py 使用的统一 LLM 环境变量 ────────────────────────────────────
 # 切换模型只需修改 .env，节点代码不变
@@ -41,6 +41,8 @@ LLM_MAX_RETRIES = 3
 #   LLM_BASE_URL=https://api.deepseek.com      # 标准 API，max_tokens 上限 4K
 #   LLM_BASE_URL=https://api.deepseek.com/beta # Beta API，max_tokens 可达 8K（默认）
 #   LLM_MAX_TOKENS=4000
+#   # 仅 OpenAI 兼容 Chat 接口：把网关扩展参数放进 extra_body（官方 OpenAI 不支持）
+#   # LLM_OPENAI_EXTRA_BODY={"enable_thinking": true}
 #
 # 切换到 Anthropic：
 #   LLM_PROVIDER=anthropic

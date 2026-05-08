@@ -18,6 +18,7 @@ from prompts.creation.platform_styles import (
 )
 from prompts.common.feedback_handling import USER_FEEDBACK_HANDLING
 from utils.llm import call_llm_json
+from utils.narrative_memory import build_narrative_memory_pov_section
 from utils.json_cot import flatten_cot_output
 from utils.genre_lexicon import genre_lexicon_banner
 from memory.entity_db import (
@@ -36,6 +37,7 @@ from prompts.common.emotional_bond_doctrine import (
     merge_ebd_entries_for_expand1,
 )
 from prompts.common.variable_elasticity import VARIABLE_ELASTICITY_RULE_BLOCK
+from prompts.common.era_lexicon_filter import era_lexicon_system_suffix
 
 
 def _karmic_evolution_section(node: dict) -> str:
@@ -536,7 +538,7 @@ async def expand1_node(state: CreationState, writer: StreamWriter) -> dict:
     if (
         _seed.strip()
         and current_idx == 0
-        and not (state.get("completed_chapters") or [])
+        and int(state.get("global_settled_event_count", 0) or 0) == 0
         and _vol0
     ):
         opening_seed_section = (
@@ -586,6 +588,8 @@ async def expand1_node(state: CreationState, writer: StreamWriter) -> dict:
         + f"\n\n{LIVING_COMPANION_RULES}"
         + f"\n\n{DEEPNOVEL_LITERARY_CONSTITUTION}"
         + f"\n\n{ADVANCED_LITERARY_RULES}"
+        + "\n\n"
+        + era_lexicon_system_suffix(state)
     )
 
     raw = await call_llm_json(expand1_sys, user_prompt, max_tokens=8000)
@@ -885,8 +889,12 @@ async def expand1_v43_node(state: CreationState, writer: StreamWriter) -> Comman
     path_func = current_path.get("narrative_function", "")
     quest_motivation_section = _build_quest_motivation_section(state, chapter_function=path_func)
 
+    _nm = build_narrative_memory_pov_section(state)
+    narrative_memory_pov_section = (_nm + "\n\n") if _nm.strip() else ""
+
     user_prompt = EXPAND1_V43_USER_TEMPLATE.format(
         quest_motivation_section=quest_motivation_section,
+        narrative_memory_pov_section=narrative_memory_pov_section,
         path_definition=path_definition_text,
         world_archive=world_archive_text,
         protagonist_archive=protagonist_archive_text,
@@ -901,6 +909,8 @@ async def expand1_v43_node(state: CreationState, writer: StreamWriter) -> Comman
     expand1_v43_sys = (
         EXPAND1_V43_SYSTEM
         + (f"\n\n{_platform_macro}\n" if _platform_macro.strip() else "")
+        + "\n\n"
+        + era_lexicon_system_suffix(state)
     )
 
     raw = await call_llm_json(expand1_v43_sys, user_prompt, max_tokens=4000)

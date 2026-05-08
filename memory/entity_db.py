@@ -537,8 +537,9 @@ async def get_character_cards_with_tendencies(
     char_names: list[str],
 ) -> list[dict]:
     """
-    按人物名列表查询实体卡，返回含 innate_traits/mental_core 与 appearance 的完整卡片。
-    用于 expand1 注入行为倾向，write 注入外貌（首次出场时）。
+    按人物名列表查询实体卡，返回含 innate_traits/mental_core、appearance、
+    independent_agenda 与叙事流窗口（long_term_stream / short_term_stream 尾部切片）的完整卡片。
+    用于 expand1 注入行为倾向，write 注入外貌（首次出场时），event_chain_gen 注入 World Tick 阅历。
     """
     if not char_names:
         return []
@@ -564,6 +565,24 @@ async def get_character_cards_with_tendencies(
                         _td_out = max(0, min(100, int(round(float(_td)))))
                     except (TypeError, ValueError):
                         _td_out = None
+                _lt_raw = data.get("long_term_stream") or []
+                _st_raw = data.get("short_term_stream") or []
+                if isinstance(_lt_raw, list):
+                    _lt_out = [
+                        str(x).strip()[:500]
+                        for x in _lt_raw
+                        if str(x).strip()
+                    ][-15:]
+                else:
+                    _lt_out = []
+                if isinstance(_st_raw, list):
+                    _st_out = [
+                        str(x).strip()[:400]
+                        for x in _st_raw
+                        if str(x).strip()
+                    ][-10:]
+                else:
+                    _st_out = []
                 results.append({
                     "name":                    row["name"],
                     "aliases":                 json.loads(row["aliases"] or "[]"),
@@ -597,6 +616,10 @@ async def get_character_cards_with_tendencies(
                     "reverse_scale":           (data.get("reverse_scale") or "").strip(),
                     # 补丁 v4.3：与主角卡同构，供 event_chain / 暗流推导使用
                     "capabilities":            data.get("capabilities") if isinstance(data.get("capabilities"), dict) else {},
+                    # 叙事流 + 独立议程：供 event_chain World Tick 基于已有阅历推演（非空窗口由 bible/world_tick 累积）
+                    "independent_agenda":    str(data.get("independent_agenda") or "").strip(),
+                    "long_term_stream":       _lt_out,
+                    "short_term_stream":      _st_out,
                 })
     return results
 

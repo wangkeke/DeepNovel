@@ -89,6 +89,7 @@ def shallow_world_archive(world_setting: dict) -> dict:
         "world_taboos": list(world_setting.get("world_taboos") or []),
         "unique_settings": list(world_setting.get("unique_settings") or []),
         "gray_zone_ecology": list(world_setting.get("gray_zone_ecology") or []),
+        "narrative_era": str(world_setting.get("narrative_era") or "").strip(),
     }
 
 

@@ -1,11 +1,12 @@
 """
-idea_forge_node.py：意图解析与脑洞熔炉节点
+idea_forge_node.py：意图解析与脑洞熔炉节点（v4.3 补丁 E：脑洞引擎）
 
 职责：
-  1. 接收用户的无格式输入（哪怕只有一句话，或长达万字的大纲）。
-  2. 提取出系统必需的【创世变量】（用于启动 Genesis）。
-  3. 将用户提到的具体情节、人物、设定分拣为【用户强制锚点 user_anchors】。
-  4. 写入 state，供下游 world_build / 冰山 / 分卷 / 事件链 嵌合（下游按需注入 prompt）。
+  1. 接收用户的无格式输入（零输入、一句话或万字大纲均可）。
+  2. 调用脑洞引擎四阶情绪配方提示词，产出 brainwave_formula / downstream_instructions 等。
+  3. 合并 genesis_variables（与旧流水线一致）与 operational_user_anchors（下游 world_build / 冰山滴灌）。
+  4. 写入 state 后进入 human_review_brainwave；开篇 immediate 任务由 iceberg_deduction 在 PROMPT4 缺失时回退注入。
+  文档第五节、第六节为流程/衔接说明，见《补丁文档 E》与 utils.brainwave_engine、各下游节点注入逻辑，不写入 LLM。
 """
 from __future__ import annotations
 
@@ -18,70 +19,19 @@ from knowledge.story_variables import (
     map_genre_bucket,
     sample_variables,
     resolve_fictional_hook_profile,
+    build_genre_constraints_prompt_for_brainwave,
 )
 from schemas.state import CreationState
 from utils.display import node_done, node_step
 from utils.llm import call_llm_json
-from prompts.common.deepnovel_constitution import DEEPNOVEL_CONSTITUTION
 from prompts.creation.synopsis import PLATFORM_MACRO_HINTS
+from prompts.common.deepnovel_constitution import DEEPNOVEL_CONSTITUTION
+from prompts.creation.brainwave_engine import (
+    BRAINWAVE_ENGINE_BODY,
+    BRAINWAVE_IDEA_FORGE_GRAPH_BRIDGE,
+)
 
 logger = logging.getLogger("deepnovel.idea_forge")
-
-_IDEA_FORGE_SYSTEM = (DEEPNOVEL_CONSTITUTION + "\n\n" + """
-你是一位顶级网文主编、数据结构化专家，也是深谙读者心理的责任编辑。
-
-用户的每一个字（一句话脑洞或万字大纲）都是**创世奇点**：你只「翻译」、不替用户改稿。
-【表层】题材、人物出厂设定、必发桥段、感情线、用户锚定的爽点；【深层】识别精神代偿（逆袭、被偏爱、掌控感、手撕伪善、清醒独立、证道等）——可在 `reader_catharsis_note` 用一句话写出，不得编造与用户锚点无关的爽点。
-
-你的任务是充当“全维度锚点分拣机”：
-1. 【绝对忠实】：只要用户明确提出了人物名、特定事件、感情线要求、特定设定，你必须【原封不动】地提取到对应的 `user_anchors` 结构中。绝不可删改用户的私货！
-2. 【智能补全】：如果用户没提到某些方面（比如只给了个结尾，没给人物），对应的 anchor 数组请保持为空[]，让下游系统自行推演。
-3. 【系统变量翻译】：你必须根据用户的描述氛围，为其推断出最合适的 5 大 `genesis_variables` 字段（targeting_degree、emotional_degree、human_logic、story_mode、fictional_hook）。
-
-只返回符合格式的 JSON，不加任何前言。
-""").strip()
-
-_IDEA_FORGE_JSON_TASK = """
-## 任务：请解析并分拣为以下 JSON 结构
-
-{
-  "genesis_variables": {
-    "targeting_degree": 整数0-100(根据用户脑洞中主角开局面临的危机烈度推断，灭门填90+，平淡开局填10+),
-    "emotional_degree": 整数-100到100(开局核心矛盾方对主角的情感：血海深仇<-80，漠视0左右，病态深爱>80),
-    "human_logic": "从【马基雅维利逻辑/设局逻辑/野心家逻辑/复仇逻辑/忍辱逻辑/执念逻辑/舔狗逻辑/推理逻辑】中选一个最契合反派或整体基调的",
-    "story_mode": "从【极渊求生/极渊坠落/浮沉逆转/暗流涌动/极道横推】中选一个",
-    "fictional_hook": "用户指定的金手指（如‘读心术’、‘系统’）。若用户未指定，请结合题材为其量身定制一个，若用户明确要求无外挂，必须填‘无’"
-  },
-
-  "user_anchors": {
-    "protagonist": {
-      "name": "主角的姓名（未提及则填空字符串）",
-      "setting": "主角的身份背景、性格特征、外貌、执念等核心设定（无则填空）"
-    },
-    "opening_scene": "如果用户描述了开局画面，请提取。若无填 null",
-    "world_rules":[
-      "用户明确设定的世界观/功法/阶级/禁忌等（无则空数组）"
-    ],
-    "characters":[
-      {
-        "name": "人物名",
-        "role": "如：女主/反派/炮灰/白月光",
-        "traits": "用户赋予的性格或命运设定"
-      }
-    ],
-    "emotional_lines":[
-      "用户要求的感情线（如：被渣男背叛后断情绝爱、大女主驾驭群臣、先婚后爱等。无则空数组）"
-    ],
-    "plot_events":[
-      {
-        "event_description": "用户要求必须发生的具体桥段（如：暴雨中女配背叛跌落悬崖、宴会上当众打脸退婚女）",
-        "expected_stage": "推断该事件应放在：开篇 / 中期 / 后期 / 结局"
-      }
-    ],
-    "reader_catharsis_note": "一句话：用户潜意识想要的精神代偿（可为空字符串）"
-  }
-}
-""".strip()
 
 
 def _merge_genesis_variables(genre_request: str, llm_gv: dict | None) -> dict:
@@ -94,7 +44,6 @@ def _merge_genesis_variables(genre_request: str, llm_gv: dict | None) -> dict:
         v = llm_gv.get(key)
         if isinstance(v, str) and v.strip():
             out[key] = v.strip()
-    # 金手指名称归一：若用户/LLM 给出别名，统一为矩阵 display_name，便于后续索引注入。
     fh = str(out.get("fictional_hook") or "").strip()
     spec = resolve_fictional_hook_profile(fh)
     if spec and spec.get("display_name"):
@@ -142,8 +91,84 @@ def _normalize_user_anchors(raw: object) -> dict:
     return ua
 
 
+def _operational_from_patch_e_doc(result: dict) -> dict:
+    """
+    若模型未输出 operational_user_anchors，则从补丁 E 的 user_anchors（immutable_*）
+    与 brainwave_formula 粗映射为下游旧结构。
+    """
+    doc_ua = result.get("user_anchors")
+    if not isinstance(doc_ua, dict):
+        doc_ua = {}
+    imm_c = doc_ua.get("immutable_characters")
+    if not isinstance(imm_c, list):
+        imm_c = []
+    imm_p = doc_ua.get("immutable_plot_beats")
+    if not isinstance(imm_p, list):
+        imm_p = []
+    imm_r = doc_ua.get("immutable_relationships")
+    if not isinstance(imm_r, list):
+        imm_r = []
+    tone = doc_ua.get("immutable_tone")
+    bf = result.get("brainwave_formula")
+    if not isinstance(bf, dict):
+        bf = {}
+    oc = bf.get("opening_crisis")
+    if not isinstance(oc, dict):
+        oc = {}
+    hook = str(bf.get("hook_sentence") or bf.get("core_hook") or "").strip()
+
+    chars = [{"name": str(x).strip(), "role": "用户锚定", "traits": ""} for x in imm_c if str(x).strip()]
+    plot_events = [
+        {"event_description": str(x).strip(), "expected_stage": "开篇"}
+        for x in imm_p
+        if str(x).strip()
+    ]
+    emotional_lines = [str(x).strip() for x in imm_r if str(x).strip()]
+    opening_scene = str(oc.get("scene") or "").strip() or None
+    reader_note = hook
+    if isinstance(tone, str) and tone.strip():
+        reader_note = f"{tone.strip()}；{reader_note}".strip("；") if reader_note else tone.strip()
+
+    return {
+        "protagonist": {"name": "", "setting": ""},
+        "opening_scene": opening_scene,
+        "world_rules": [],
+        "characters": chars,
+        "emotional_lines": emotional_lines,
+        "plot_events": plot_events,
+        "reader_catharsis_note": reader_note[:800] if reader_note else "",
+    }
+
+
+def _prepend_narrative_era_into_anchors(ua: dict, narrative_era: str) -> dict:
+    """将根级 narrative_era 同步进 user_anchors.world_rules，便于下游与人工审阅一致看见。"""
+    ne = (narrative_era or "").strip()
+    if not ne:
+        return ua
+    ua = dict(ua)
+    wr = [str(x) for x in (ua.get("world_rules") or [])]
+    prefix = f"[叙事时代与语体锚点] {ne}"
+    filtered = [w for w in wr if not w.strip().startswith("[叙事时代与语体锚点]")]
+    ua["world_rules"] = [prefix] + filtered
+    return ua
+
+
+def _brainwave_engine_payload(result: dict) -> dict:
+    out: dict = {
+        "user_anchors": result.get("user_anchors"),
+        "open_space": result.get("open_space"),
+        "brainwave_formula": result.get("brainwave_formula"),
+        "inferred_world_seeds": result.get("inferred_world_seeds"),
+        "downstream_instructions": result.get("downstream_instructions"),
+    }
+    ne = str(result.get("narrative_era") or "").strip()
+    if ne:
+        out["narrative_era"] = ne
+    return {k: v for k, v in out.items() if v is not None}
+
+
 async def idea_forge_node(state: CreationState) -> Command:
-    node_step("启动脑洞熔炉：全维度解析用户创作锚点…")
+    node_step("启动脑洞熔炉：脑洞引擎（补丁 E）解析用户锚点与情绪配方…")
 
     raw_input = (state.get("user_raw_input") or "").strip()
     file_path = (state.get("framework_file_path") or "").strip()
@@ -156,6 +181,12 @@ async def idea_forge_node(state: CreationState) -> Command:
     parts: list[str] = []
     if raw_input:
         parts.append(raw_input)
+    regen_fb = (state.get("brainwave_regen_feedback") or "").strip()
+    if regen_fb:
+        parts.append(
+            "## 【用户要求调整脑洞/叙事锚点（须在不违背题材铁律的前提下整体自洽重写）】\n"
+            + regen_fb
+        )
     if file_path:
         path = Path(file_path)
         if path.is_file():
@@ -167,49 +198,78 @@ async def idea_forge_node(state: CreationState) -> Command:
     content = "\n\n".join(p for p in parts if p)
 
     if not content.strip():
-        logger.info("用户无文本锚点输入：采样创世变量后进入世界设定。")
-        return Command(
-            update={"genesis_variables": sample_variables(genre)},
-            goto="world_build",
+        content = (
+            "（本次为**零输入**：用户未提供文本锚点。请在「第零步」将用户侧视为全部开放空间，"
+            f"仅依据下列题材与平台风格，自主完成第一至四阶推理并输出规定 JSON。题材：{genre}。）"
         )
+        logger.info("用户无文本锚点输入：以零输入模式调用脑洞引擎。")
 
+    genre_iron = build_genre_constraints_prompt_for_brainwave(genre)
+    brainwave_system = (
+        DEEPNOVEL_CONSTITUTION + "\n\n" + genre_iron + "\n\n" + BRAINWAVE_ENGINE_BODY
+    )
     user_prompt = (
+        "**节点职责**：接收任意形式的用户输入，结合题材和平台风格，\n"
+        "通过四阶情绪配方系统生成具备商业爆款潜力的完整脑洞配方。\n\n"
         f"## 用户指定题材：{genre}\n"
-        f"## 目标平台与读者定位（必须严格遵守；影响主角性别、感情线与故事舞台）\n"
+        f"{genre_iron}"
+        f"## 目标平台与读者定位（必须严格遵守）\n"
         f"{platform_macro_hint}\n\n"
         f"## 用户的脑洞/原始输入：\n{content}\n\n"
-        f"{_IDEA_FORGE_JSON_TASK}"
+        f"{BRAINWAVE_IDEA_FORGE_GRAPH_BRIDGE}"
     )
 
     try:
-        result = await call_llm_json(_IDEA_FORGE_SYSTEM, user_prompt)
+        result = await call_llm_json(brainwave_system, user_prompt, max_tokens=8000)
     except Exception as e:
-        logger.warning("idea_forge LLM 失败，跳过锚点解析：%s", e)
+        logger.warning("idea_forge LLM 失败，回退采样：%s", e)
         return Command(
-            update={"genesis_variables": sample_variables(genre)},
-            goto="world_build",
+            update={
+                "genesis_variables": sample_variables(genre),
+                "user_anchors": {},
+                "brainwave_engine": {},
+                "narrative_era": "",
+                "brainwave_regen_feedback": "",
+                "brainwave_approved": False,
+            },
+            goto="human_review_brainwave",
         )
 
     if not isinstance(result, dict):
         return Command(
-            update={"genesis_variables": sample_variables(genre)},
-            goto="world_build",
+            update={
+                "genesis_variables": sample_variables(genre),
+                "user_anchors": {},
+                "brainwave_engine": {},
+                "narrative_era": "",
+                "brainwave_regen_feedback": "",
+                "brainwave_approved": False,
+            },
+            goto="human_review_brainwave",
         )
 
     gv = _merge_genesis_variables(genre, result.get("genesis_variables"))
-    ua = _normalize_user_anchors(result.get("user_anchors"))
+    op = result.get("operational_user_anchors")
+    if isinstance(op, dict) and (op.get("protagonist") is not None or op.get("characters") is not None):
+        ua = _normalize_user_anchors(op)
+    else:
+        ua = _normalize_user_anchors(_operational_from_patch_e_doc(result))
 
-    # 不在此写入 protagonist_name：该字段表示「主角卡已确认」后的标准名。
-    # 锚点里的主角名仅放在 user_anchors.protagonist，供 genesis / 开篇滴灌；
-    # 若此处预填 protagonist_name，会与 graph 中「有 protagonist_name 即进分卷」冲突，直接跳过主角卡流程。
+    ne = str(result.get("narrative_era") or "").strip()
+    ua = _prepend_narrative_era_into_anchors(ua, ne)
+    be = _brainwave_engine_payload(result)
 
     update_payload = {
         "genesis_variables": gv,
         "user_anchors": ua,
+        "brainwave_engine": be,
+        "narrative_era": ne,
+        "brainwave_regen_feedback": "",
+        "brainwave_approved": False,
     }
 
-    node_done("脑洞炼化完成！用户锚点已锁定。")
+    node_done("脑洞炼化完成！脑洞引擎输出已写入 state。")
     return Command(
         update=update_payload,
-        goto="world_build",
+        goto="human_review_brainwave",
     )

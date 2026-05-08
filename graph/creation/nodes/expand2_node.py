@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from langgraph.types import StreamWriter
 from schemas.state import CreationState
+from prompts.common.era_lexicon_filter import era_lexicon_system_suffix
 from prompts.creation.expand2 import EXPAND2_SYSTEM, EXPAND2_USER_TEMPLATE
 from prompts.creation.platform_styles import (
     RULE_PRECEDENCE_NOTICE,
@@ -287,7 +288,9 @@ async def expand2_node(state: CreationState, writer: StreamWriter) -> dict:
         + EXPAND2_SYSTEM
         + f"\n\n{POV_AND_CUTAWAY_RULES}"
         + f"\n\n{DEEPNOVEL_LITERARY_CONSTITUTION}"
-        + f"\n\n{ADVANCED_LITERARY_RULES}",
+        + f"\n\n{ADVANCED_LITERARY_RULES}"
+        + "\n\n"
+        + era_lexicon_system_suffix(state),
         user_prompt,
     )
     result = flatten_cot_output(raw if isinstance(raw, dict) else {})

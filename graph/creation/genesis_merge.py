@@ -51,10 +51,13 @@ def _txt(v: Any, default: str = "") -> str:
     return s if s else default
 
 
-def world_setting_from_iceberg(world_raw: dict, genre_request: str) -> dict:
-    """冰山 world JSON → world_build_node 期望的五键结构。"""
+def world_setting_from_iceberg(
+    world_raw: dict, genre_request: str, prior_world: dict | None = None,
+) -> dict:
+    """冰山 world JSON → world_build_node 期望的结构（含 narrative_era 继承）。"""
     if not isinstance(world_raw, dict):
         world_raw = {}
+    prior = prior_world if isinstance(prior_world, dict) else {}
     rules = world_raw.get("world_rules") or []
     if not isinstance(rules, list):
         rules = [str(rules)] if rules else []
@@ -81,12 +84,15 @@ def world_setting_from_iceberg(world_raw: dict, genre_request: str) -> dict:
     if not isinstance(uniq, list):
         uniq = [str(uniq)] if uniq else []
 
+    narrative_era = _txt(world_raw.get("narrative_era")) or _txt(prior.get("narrative_era"))
+
     return {
         "basic_rules": basic_rules,
         "power_structure": [str(x) for x in ps if str(x).strip()],
         "geography": geo,
         "world_taboos": [],
         "unique_settings": [str(x) for x in uniq if str(x).strip()],
+        "narrative_era": narrative_era,
     }
 
 
@@ -272,13 +278,15 @@ def core_cast_from_iceberg(cast_raw: dict, synopsis_title: str = "") -> dict:
     uv_src = cast_raw.get("ultimate_villain") or {}
     if not isinstance(uv_src, dict):
         uv_src = {}
-    vol_uv = max(1, _num(uv_src.get("appears_from_volume"), 3))
 
     ultimate_villain = {
         "name": _txt(uv_src.get("name"), "宿敌") or "宿敌",
         "identity": _txt(uv_src.get("identity"), "立场对立的终极对手"),
         "core_motivation": _txt(uv_src.get("core_motivation")) or "利益与道路的根本冲突",
-        "appears_from_volume": vol_uv,
+        "independent_agenda": _txt(uv_src.get("independent_agenda"))
+        or _txt(uv_src.get("core_motivation"), "与主角长期对撞的结构议程"),
+        "action_trigger": _txt(uv_src.get("action_trigger"))
+        or "当主角切实威胁其核心利益、破坏其秩序接口或抬高价码至值得亲自清算时",
         "human_logic": _txt(uv_src.get("human_logic"), "野心家逻辑"),
         "current_mental_state": _txt(uv_src.get("current_mental_state")),
         "mental_growth_path": _txt(uv_src.get("mental_growth_path")),
@@ -321,7 +329,10 @@ def core_cast_from_iceberg(cast_raw: dict, synopsis_title: str = "") -> dict:
             "name": name,
             "identity": _txt(c.get("identity")) or "开篇相关人物",
             "relationship": _txt(c.get("relationship_type") or c.get("connection_to_opening")) or "羁绊待演",
-            "appears_from_volume": 0,
+            "independent_agenda": _txt(c.get("independent_agenda"))
+            or (conn[:160] if conn else "与开篇处境绑定的个人议程"),
+            "action_trigger": _txt(c.get("action_trigger"))
+            or "当主角选择触及其对亲情/面子/生存资源的底线时",
             "current_mental_state": _txt(c.get("current_mental_state")),
             "mental_growth_path": _txt(c.get("mental_growth_path")),
             "reverse_scale": _txt(c.get("reverse_scale")),
@@ -343,7 +354,8 @@ def core_cast_from_iceberg(cast_raw: dict, synopsis_title: str = "") -> dict:
             "name": "未名情感线",
             "identity": "与主角有情感张力的开篇相关者",
             "relationship": "单恋/暧昧/双向未定，待人审细化",
-            "appears_from_volume": 0,
+            "independent_agenda": "在情感与生存处境之间的个人挣扎与取舍",
+            "action_trigger": "当主角的公开选择与其自尊/依赖发生正面冲突时",
             "current_mental_state": "",
             "mental_growth_path": "",
             "reverse_scale": "",
@@ -358,7 +370,8 @@ def core_cast_from_iceberg(cast_raw: dict, synopsis_title: str = "") -> dict:
             "name": "未命名羁绊",
             "identity": "开篇现场的核心关系人",
             "relationship": "亲属或拟亲属锚点",
-            "appears_from_volume": 0,
+            "independent_agenda": "守护既有亲情秩序并在变局中自保",
+            "action_trigger": "当主角的行为直接危及家族声誉或亲密关系边界时",
             "current_mental_state": "",
             "mental_growth_path": "",
             "reverse_scale": "",
@@ -377,16 +390,20 @@ def core_cast_from_iceberg(cast_raw: dict, synopsis_title: str = "") -> dict:
             "name": ultimate_villain["name"],
             "identity": ultimate_villain["identity"],
             "connection_to_opening": "幕后结构与开篇惨事的因果链",
-            "appears_from_volume": max(vol_uv, 2),
         }
-    vol_sp = max(1, _num(sp_src.get("appears_from_volume"), 2))
     supreme_power = {
         "name": _txt(sp_src.get("name"), "最高掌权者"),
         "identity": _txt(sp_src.get("identity"), "宏观秩序顶端"),
         "stance_to_protagonist": "漠视",
-        "appears_from_volume": vol_sp,
+        "independent_agenda": _txt(sp_src.get("independent_agenda")) or (
+            "维持顶端秩序并消化结构性冲突的外溢；"
+            "对低位波澜保持可预测的傲慢与工具化态度"
+        ),
+        "action_trigger": _txt(sp_src.get("action_trigger")) or (
+            "当局势威胁统治合法性、核心利益链断裂或必须亲自止损以避免体系崩盘时"
+        ),
         "note": (
-            "叙事侧重可参考本卷次；对主角前中期表现为极致随意与傲慢，不当平等对手；"
+            "对主角前中期表现为极致随意与傲慢，不当平等对手；"
             "中后期主角撼动其基本盘后才进入真对决。"
         ),
         "ebd_to_protagonist": -12,

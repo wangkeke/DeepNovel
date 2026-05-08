@@ -13,7 +13,8 @@ import json
 from utils.volume_fields import format_dynamic_gray_factions_for_prompt
 from utils.v42_flow import protagonist_capabilities_cli_block
 
-console = Console()
+# legacy_windows=False：避免在 GBK 代码页控制台上打印 ✓/⚠ 等 Unicode 时崩溃
+console = Console(legacy_windows=False)
 
 
 def node_step(step_name: str) -> None:
@@ -22,21 +23,21 @@ def node_step(step_name: str) -> None:
 
 
 def node_done(result_summary: str = "") -> None:
-    """步骤完成"""
+    """步骤完成（避免 Windows GBK 控制台对 Unicode 符号编码失败，使用 ASCII 标记）"""
     if result_summary:
-        console.print(f"  [green]✓[/green]  [dim]{result_summary}[/dim]")
+        console.print(f"  [green][+][/green]  [dim]{result_summary}[/dim]")
     else:
-        console.print(f"  [green]✓[/green]")
+        console.print(f"  [green][+][/green]")
 
 
 def node_warn(msg: str) -> None:
     """节点警告（不中断流程）"""
-    console.print(f"\n  [yellow]⚠[/yellow]  {msg}")
+    console.print(f"\n  [yellow][!][/yellow]  {msg}")
 
 
 def node_error(msg: str) -> None:
     """节点错误"""
-    console.print(f"\n  [red]✗[/red]  {msg}")
+    console.print(f"\n  [red][x][/red]  {msg}")
 
 
 def print_blueprint_saved(blueprint_id: str, title: str) -> None:
@@ -140,7 +141,7 @@ def print_interrupt_prompt(prompt_type: str, content: dict) -> None:
                 detail = "有详细情节" if v.get("has_detailed_plot") else "只有方向"
                 console.print(
                     f"  第{v.get('volume_index', 0)+1}卷：{v.get('volume_name', '')}  "
-                    f"[dim]（{detail}，约{v.get('estimated_chapters', '?')}章）[/dim]"
+                    f"[dim]（{detail}，目标约{v.get('target_events', '?')}事件）[/dim]"
                 )
         write_rules = content.get("write_rules", "")
         if write_rules:
@@ -703,6 +704,34 @@ def print_interrupt_prompt(prompt_type: str, content: dict) -> None:
             expand=False,
         ))
 
+    elif prompt_type == "brainwave_review":
+        ne = str(content.get("narrative_era") or "").strip()
+        gv = content.get("genesis_variables") if isinstance(content.get("genesis_variables"), dict) else {}
+        ua = content.get("user_anchors") if isinstance(content.get("user_anchors"), dict) else {}
+        be = content.get("brainwave_engine") if isinstance(content.get("brainwave_engine"), dict) else {}
+        gv_s = json.dumps(gv, ensure_ascii=False, indent=2) if gv else "{}"
+        ua_s = json.dumps(ua, ensure_ascii=False, indent=2) if ua else "{}"
+        be_s = json.dumps(be, ensure_ascii=False, indent=2) if be else "{}"
+        max_each = 3200
+        if len(gv_s) > max_each:
+            gv_s = gv_s[:max_each] + "\n…（已截断）"
+        if len(ua_s) > max_each:
+            ua_s = ua_s[:max_each] + "\n…（已截断）"
+        if len(be_s) > max_each:
+            be_s = be_s[:max_each] + "\n…（已截断）"
+        body = (
+            f"[bold]叙事时代与语体锚点[/bold]\n{ne or '（未填）'}\n\n"
+            f"[bold]变量桶 genesis_variables[/bold]\n{gv_s}\n\n"
+            f"[bold]用户锚点 user_anchors[/bold]\n{ua_s}\n\n"
+            f"[bold]脑洞引擎 brainwave_engine[/bold]\n{be_s}"
+        )
+        console.print(Panel(
+            body,
+            title="💡 脑洞引擎产出（确认后进入世界设定卡）",
+            border_style="cyan",
+            expand=False,
+        ))
+
     elif prompt_type == "core_cast_review":
         c = content if isinstance(content, dict) else {}
         uv = c.get("ultimate_villain") or {}
@@ -734,7 +763,8 @@ def print_interrupt_prompt(prompt_type: str, content: dict) -> None:
         body = (
             f"[bold]最终宿敌：[/bold]{uv.get('name', '')}（{uv.get('identity', '')}）\n"
             f"  动机：{uv.get('core_motivation', '')}\n"
-            f"  约从第 {uv.get('appears_from_volume', '?')} 卷露头角"
+            f"  独立议程：{uv.get('independent_agenda', '')}\n"
+            f"  碰撞触发：{uv.get('action_trigger', '')}"
             + (f"\n{uv_ebd}" if uv_ebd else "")
             + f"\n\n[bold]一生挚友：[/bold]{ally_names or '（无）'}"
             + (
@@ -744,6 +774,8 @@ def print_interrupt_prompt(prompt_type: str, content: dict) -> None:
             )
             + f"\n\n[bold]最高掌权：[/bold]{sp.get('name', '')}（{sp.get('identity', '')}）\n"
             f"  立场：{sp.get('stance_to_protagonist', '')}\n"
+            f"  独立议程：{sp.get('independent_agenda', '')}\n"
+            f"  下场触发：{sp.get('action_trigger', '')}\n"
             f"  备注：{sp.get('note', '')}"
             + (f"\n{sp_ebd}" if sp_ebd else "")
         )
@@ -776,26 +808,32 @@ def print_interrupt_prompt(prompt_type: str, content: dict) -> None:
                     )
                 et_s = "\n    EBD 目标：" + "；".join(parts) if parts else ""
             aa_lines: list[str] = []
-            arc_anchors = v.get("arc_anchors")
-            if isinstance(arc_anchors, list) and arc_anchors:
-                aa_lines.append("    [bold]arc_anchors（本卷事件锚点 · event_chain_gen 读取）[/bold]")
-                for a in arc_anchors[:20]:
-                    if not isinstance(a, dict):
+            mc = v.get("milestone_conditions")
+            if isinstance(mc, list) and mc:
+                aa_lines.append(
+                    "    [bold]milestone_conditions（本卷里程碑引力场 · event_chain_gen 读取）[/bold]"
+                )
+                for m in mc[:20]:
+                    if not isinstance(m, dict):
                         continue
-                    aid = a.get("anchor_id", "?")
-                    mt = str(a.get("milestone_type") or "").strip()
-                    arr = str(a.get("arrival_condition") or "").strip()
-                    comp = str(a.get("completion_signal") or "").strip()
-                    pos = str(a.get("position") or "").strip()
+                    mid = str(m.get("milestone_id") or "").strip()
+                    nm = str(m.get("name") or "").strip()
+                    ts = str(m.get("trigger_state") or "").strip()
+                    fb = str(m.get("forbidden_micro_actions") or "").strip()
+                    closer = " [收卷位]" if m.get("is_volume_closer") else ""
                     aa_lines.append(
-                        f"      · 锚点 {aid} [{mt}] position={pos}\n"
-                        f"        arrival：{arr[:200]}{'…' if len(arr) > 200 else ''}\n"
-                        f"        completion_signal：{comp[:200]}{'…' if len(comp) > 200 else ''}"
+                        f"      · {mid}{closer} {nm}\n"
+                        f"        trigger_state：{ts[:220]}{'…' if len(ts) > 220 else ''}\n"
+                        f"        forbidden_micro_actions：{fb[:180]}{'…' if len(fb) > 180 else ''}"
                     )
+            elif not aa_lines:
+                aa_lines.append(
+                    "    [dim]（本卷无 milestone_conditions，请重新生成分卷或检查数据）[/dim]"
+                )
             aa_block = ("\n" + "\n".join(aa_lines)) if aa_lines else ""
             lines.append(
                 f"  第{int(vi) + 1}卷「{v.get('volume_name', '')}」"
-                f"  约{v.get('estimated_chapters', 0)}章  "
+                f"  目标{v.get('target_events', 0)}事件  "
                 f"烈度：{v.get('conflict_intensity', '')}\n"
                 f"    方向：{v.get('volume_direction', '')}\n"
                 f"    地点：{v.get('location_scope', '')}\n"
@@ -857,18 +895,23 @@ def print_interrupt_prompt(prompt_type: str, content: dict) -> None:
         ))
 
     elif prompt_type == "batch":
-        nodes    = content.get("story_path", [])
-        chapters = content.get("completed_chapters", [])
-        lines    = []
+        nodes = content.get("story_path", [])
+        gsec = content.get("global_settled_event_count", "")
+        vol_ev = content.get("volume_event_count", "")
+        head = ""
+        if gsec != "":
+            head = f"[dim]全书已结算事件：{gsec}"
+            if vol_ev != "":
+                head += f" ｜ 本卷事件：{vol_ev}"
+            head += "[/dim]\n\n"
+        lines = []
         for i, node in enumerate(nodes):
-            word_count = len(chapters[i]) if i < len(chapters) else 0
             lines.append(
-                f"  [bold]{i+1}.[/bold]  "
-                f"[cyan]{node.get('node_name', '')}[/cyan]  "
-                f"[dim]{word_count} 字[/dim]"
+                f"  [bold]{i + 1}.[/bold]  "
+                f"[cyan]{node.get('node_name', '')}[/cyan]"
             )
         console.print(Panel(
-            "\n".join(lines) if lines else "（暂无章节）",
+            head + ("\n".join(lines) if lines else "（暂无节点）"),
             title=f"📝 本批次完成（共 {len(nodes)} 节）",
             border_style="green",
             expand=False,

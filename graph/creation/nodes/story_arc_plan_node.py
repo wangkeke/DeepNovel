@@ -1,4 +1,4 @@
-﻿"""
+"""
 story_arc_plan_node：全书分卷规划
 
 普通创作：按卷 **逐次** 调用 LLM 生成（每卷一个 JSON 对象），避免一次输出五卷导致截断。
@@ -21,6 +21,11 @@ from prompts.creation.platform_styles import ANTI_CLICHE_AND_TEXTURE_RULES, plat
 from utils.book_opposition_anchor import book_opposition_prompt_block
 from utils.volume_fields import normalize_dynamic_gray_factions
 from utils.v42_flow import protagonist_archive_prompt_block
+from utils.brainwave_engine import story_arc_brainwave_suffix
+from utils.volume_milestones import (
+    default_milestone_conditions_placeholder,
+    ensure_milestone_closer_flag,
+)
 
 logger = logging.getLogger("deepnovel.story_arc_plan")
 
@@ -151,30 +156,31 @@ _VOLUME_JSON_SPEC = """
     "maturity_change": "成熟度变化描述（打破了哪种幻想，成长了哪个维度）",
     "key_illusion_shattered": "本卷终结的最核心幻想或认知错误"
   },
-  "arc_anchors": [
+  "volume_macro_conflict": "本卷宏观矛盾核心（一句人话，如：旧派风水师与财阀的城中村征地博弈）",
+  "milestone_conditions": [
     {
-      "anchor_id": 1,
-      "position": "early（约前 1-3 个事件）",
-      "milestone_type": "开篇碰撞",
-      "arrival_condition": "主角已被卷入冲突；触发条件与 opening_collision 一致",
-      "content_source": "直接继承自 iceberg_deduction.opening_collision，不由 event_chain 重新推导",
-      "completion_signal": "描述可客观判断此锚点已完成的标志（如：某人物死亡、某资源易手、某关系确立、某秘密揭露）"
+      "milestone_id": "m_01",
+      "milestone_kind": "crisis_collision",
+      "name": "核心矛盾被点燃（宏观状态名，禁止写成微剧本）",
+      "trigger_state": "【仅写状态断言，禁止动作与台词】：可客观判定——主角在制度/资源层面已被卷入本卷主矛盾，与结构性对立面发生首次不可回避的碰撞。",
+      "forbidden_micro_actions": "【防过度规划锁】：禁止写具体谁来、走了几步、说了哪句台词；禁止点名冰山/班底外的微观龙套；禁止唯一指定地点与死法；禁止规定具体刑侦/笔迹/纸张化验类破局手法（手法留给正文与事件引擎）。",
+      "is_volume_closer": false
     },
     {
-      "anchor_id": 2,
-      "position": "mid-early（约第 N 个事件，给出大致区间）",
-      "milestone_type": "规则反转 | 暗流浮现 | 伏笔引爆（从枚举中选一）",
-      "arrival_condition": "到达此锚点时，世界状态必须满足的条件（如某资源已消耗、某势力 current_status 已变化、某 karmic 伏笔已埋）",
-      "content_constraint": "只约束里程碑类型，具体内容由 event_chain Phase 2 循环推导生成",
-      "completion_signal": "描述可客观判断此锚点已完成的标志（如：某势力倒台、某伏笔被引爆、某角色立场发生转变）"
+      "milestone_id": "m_02",
+      "milestone_kind": "world_expansion",
+      "name": "版图或圈层跃迁（画卷展开）",
+      "trigger_state": "【仅写状态断言】：主角通过可计数、可观察的独立事件积累，已进入新的社会层级/地理舞台/或人际网络交集面，世界可写版图显著扩大（禁止微观分镜）。",
+      "forbidden_micro_actions": "禁止写死具体地图格子与唯一跑腿人名；禁止规定抵达手段。",
+      "is_volume_closer": false
     },
     {
-      "anchor_id": 99,
-      "position": "late（约最后 2-3 个事件）",
-      "milestone_type": "圈层跃迁",
-      "arrival_condition": "主角已完成本卷核心目标，protagonist_ending_position 所描述的状态变化已基本发生",
-      "content_constraint": "跃迁具体方式由循环推导生成，须对应 background_context.maturity_events 中的某触发事件",
-      "completion_signal": "描述主角完成本卷圈层跃迁的客观标志（如：主角获得某一身份/权柄/能力、核心幻想被打破）"
+      "milestone_id": "m_99",
+      "milestone_kind": "crisis_collision",
+      "name": "本卷收束与升维",
+      "trigger_state": "【仅写状态断言】：本卷明面条线已阶段性收束，压力骨架升级并自然暴露下一层威胁或下一卷伏笔。",
+      "forbidden_micro_actions": "禁止写终局动作分镜与具体台词；收卷方式由事件引擎涌现。",
+      "is_volume_closer": true
     }
   ],
   "background_context": {
@@ -190,21 +196,53 @@ _VOLUME_JSON_SPEC = """
   "arc_track": "字符串：仅 volume_index=3（第4卷）必填「路线A（灵魂黑夜）」或「路线B（极道横推，可含阳谋平推/降维打击）」；路线B下禁止为硬造曲折而强行吃瘪/降智/没收金手指，并须在 volume_direction 或本字段后用括号一句说明与 story_mode 等何以自洽；其余卷统一「不适用」。"
 }
 
-**arc_anchors 设计规则（核心）**：
-- 锚点1 永远是开篇碰撞（第1卷直接继承 iceberg_deduction.opening_collision；后续卷由上卷末尾状态自然衔接）
-- 锚点N 永远是圈层跃迁（对应 protagonist_ending_position）
-- 中间锚点 2-3 个，对应本卷必然发生的关键转折
-- **总数控制在 3-5 个**：超过 5 个即变成微观管控，压制循环推导的有机生长空间
-- 锚点只定义**里程碑类型**和 **arrival_condition**，不定义具体内容
+**【里程碑引力场法则（核心 · 状态与动作彻底分离）】**：
+- 不要写「先 A 后 B」的流水账事件链；`milestone_conditions` 是**无序**的**状态断言**集合，任一条在涌现中先被满足都合法。
+- **`milestone_kind`（机器可读 · 须为以下之一）**：
+  - `crisis_collision`：危机/破局/对决向结构性锚点（默认）。
+  - `world_expansion`：**世界扩展**——进入新层级/新地理/新网络，版图可检地变大。
+  - `jianghu_footing`：**江湖立足**——由可计数行为与可观察声望判定（例：完成至少两笔独立委托 + 在本地灰市或圈层内获得稳定外号/称呼 + 不再被普遍视为生面孔）；`trigger_state` 必须写成**可客观检验**的状态断言，禁止仅写「混熟了」。
+  - `experience_inflection`：**阅历跃迁**——独立事件积累后对世界规则/自我定位的认知发生质变；同样须**可检验**（如：曾信 X 规则，现已在实践中确认 Y 结构为真）。
+- **画卷铁律**：每卷 `milestone_conditions` 中**至少一条**的 `milestone_kind` 须为 `world_expansion`、`jianghu_footing`、`experience_inflection` 之一，且其 `trigger_state` 为非危机型、可验证状态；不能全部是 `crisis_collision`。
+- **`trigger_state`**：只写**可客观检验的世界/关系/权力/资源状态**（断言句），**绝对禁止**动词连环剧本、引号台词、走位描写（如屏退左右、收入袖中、溺毙于某池）、指定微观龙套姓名。
+- **禁止在 `trigger_state` 中规定具体【破局手法 / 物证技术细节】**（如：比对笔迹、观察纸背透印度、某化学试剂显色、某种独家剑招破局等）。只许写**状态反转**（如：主角凭借对礼法/旧物/权力规则的了悟，在关键场合使对方伪证或构陷在结构上不成立；至于是笔迹、印泥还是制度漏洞，交给下游涌现）。
+- **`forbidden_micro_actions`**：每条必须填写「防过度规划锁」——明确写出本里程碑**不允许**在大纲层锁死的微观要素（与 `trigger_state` 配套）；建议显式包含「禁止写死具体检验/破壁手法」若本卷有证物或公堂类高压场景。
+- `milestone_id` 卷内唯一；**必须且仅有一条** `is_volume_closer: true`（收卷/升维位，建议 id 用 `m_99` 或本卷最后一条）。
+- 共 **3～5 条** 为宜；过多会压制 `event_chain_gen` 的有机生长。
 
-里程碑类型枚举：开篇碰撞 | 规则反转 | 结盟 | 破局 | 圈层跃迁 | 伏笔引爆 | 暗流浮现
+【沙盒化】`volume_macro_conflict` 用一句话钉住本卷「主要矛盾场」；与 `milestone_conditions` 一致、可检。
 
-⚠️ arc_anchors 是机器可读的执行契约，event_chain_gen 直接读取。
+⚠️ `milestone_conditions` 是机器可读的执行契约，event_chain_gen 与 `milestone_progress` 联合推进。
 ⚠️ background_context 是人类可读背景，供人工审核参考，不作为 event_chain_gen 直接输入。
 ⚠️ estimated_chapters.target_range 是参考区间，实际章节数由两阶段推导自然决定。
 
 `ebd_targets`：本卷须有明显情感弧的 1～3 人即可，无则 `[]`；**优先呼应** synopsis 的 `family_emotion_line` / `romance_emotion_line`（及 core_cast 中 family/romance 角色），爱情线可多人分段上升。`ebd_bond_kind`：friendship | romance | family | …；`ebd_end` 可用区间如「+30~+50」。
 **dynamic_gray_factions（白皮书·动力层）**：至少 3～5 条为宜（可随格局增多）；写**高于本卷主线叙事靶子的利益实体**，须遵守**非对称冲突法则**与价码⇄刻意针对度：可作降维波及、漠视、余波、结构性挤压，**禁止**无代价升格为「本卷主线私人追害主反派」除非价码已到位；**拒绝强行升塔**——名单随主角上桌逐卷收束复杂度，但最高掌权者若非私人终局宿敌，卷末仍可保持背景/裁判位。**禁止**把说明文字整句当 name 填入。
+"""
+
+_ICEBERG_NON_MANDATORY_RULE = """
+🚨 **【冰山要素非强制原则】** 🚨
+冰山反推（Iceberg）里涌现的具体细节（过客称谓、器物纹样、表面桥段、`surface_trace` 等），只是给下游引擎的【可选素材库】。
+在做分卷里程碑规划时，**绝对禁止**把这些微观素材**硬编码**进 `milestone_conditions`、`volume_direction` 或 `background_context`。
+里程碑只能是高度抽象的**状态断言**（例如：证据链被切断、关键底层联络遭结构性清除、主角安全网破裂）；**禁止**把冰山里的具体人名与微观过程复述进大纲。
+"""
+
+_MACRO_BLANK_SPACE_RULE = """
+🚨 【里程碑引力场：绝对留白 + 动作域剥离 (STRICT STATE-ONLY RULE)】 🚨
+你现在在设计宏观「沙盒引力场」，**禁止**把分卷写成保姆级线性剧本。
+
+## 【状态正则 · 禁止微观动作硬编码】
+- `trigger_state` **只允许状态断言**（谁处于何种权力/危险/证据结构），**禁止**：引号台词、连续动作描写、走位（屏退、独自进入、收入袖中）、指定微观场所作案（荷花池/枯井）、指定无名龙套之死法。
+- **禁止「表现欲式」物证/手法剧透**：不得写死具体破案或翻盘的技术路径（墨迹对比、透印度、指纹式设定、独门心法招式名等）；只能写**叙事后果层面的反转**（伪证失效、构陷结构崩塌、规则裁决改写）。
+- `forbidden_micro_actions` **每条必填**：写明本里程碑不允许锁死的微观要素（与上文配套），作为模型的自检栏。
+
+## 【留白清单】
+1. 🚫 **禁止捏造微观 NPC**：除《全书核心班底》已具名者外，禁止在大纲里点名随机配角/龙套；用群体代称（「巡逻队的某个实权人物」「一支灰市佣兵」）。
+2. 🚫 **禁止规定具体代价与招式**：写成宏观因果状态（「支付了惨重 future 筹码换取结构性武力背书」），禁止写死具体物品/年限价码与唯一交易对象。
+3. ✅ **里程碑松耦合**：给 event_chain_gen 留涌现空间。
+4. 🚫 **`background_context` 留白**：`maturity_events` 等只写档位与矛盾方向，禁止分镜头脚本。
+
+违反以上规则的输出视为不合格：须重写 `milestone_conditions[].trigger_state` / `forbidden_micro_actions`、`volume_direction`、`background_context`，直至无二义微观剧本为止。
 """
 
 _WEBNOVEL_STANCE_GATING = """
@@ -304,34 +342,55 @@ def _three_act_five_volume_block(volume_index: int, total_volumes: int) -> str:
 """.strip()
 
 
-def _arc_anchors_default(index: int) -> list:
-    """当 LLM 未输出 arc_anchors 时，生成最小占位锚点列表。"""
-    return [
-        {
-            "anchor_id": 1,
-            "position": "early（约前 1-3 个事件）",
-            "milestone_type": "开篇碰撞",
-            "arrival_condition": "主角已被卷入本卷核心冲突",
-            "content_source": "继承自 iceberg_deduction.opening_collision（第1卷）或上卷末尾状态",
-            "completion_signal": "主角与本卷核心对手或冲突核心完成首次正面碰撞",
-        },
-        {
-            "anchor_id": 2,
-            "position": "mid（约中间事件区）",
-            "milestone_type": "规则反转",
-            "arrival_condition": "主角发现表面规则之下的真实博弈逻辑",
-            "content_constraint": "具体内容由 event_chain Phase 2 循环推导生成",
-            "completion_signal": "某关键信息被揭露或某势力关系发生实质性转变",
-        },
-        {
-            "anchor_id": 3,
-            "position": "late（约最后 2-3 个事件）",
-            "milestone_type": "圈层跃迁",
-            "arrival_condition": "主角完成本卷核心目标，进入更高圈层，旧麻烦解决，新维度麻烦开始",
-            "content_constraint": "跃迁方式由循环推导生成",
-            "completion_signal": "主角完成圈层跃迁，获得新身份/资源/权柄或打破核心幻想",
-        },
-    ]
+_ALLOWED_MILESTONE_KINDS = frozenset({
+    "crisis_collision",
+    "world_expansion",
+    "jianghu_footing",
+    "experience_inflection",
+})
+
+
+def _normalize_milestone_conditions(raw: list | None, index: int) -> list:
+    """校验并补齐 milestone_conditions；失败则用默认占位。"""
+    if not isinstance(raw, list) or not raw:
+        return ensure_milestone_closer_flag(
+            [dict(x) for x in default_milestone_conditions_placeholder()]
+        )
+    cleaned: list[dict] = []
+    for i, m in enumerate(raw):
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("milestone_id") or "").strip() or f"m_{i + 1:02d}"
+        name = str(m.get("name") or "").strip() or mid
+        mk_raw = str(m.get("milestone_kind") or "").strip().lower()
+        milestone_kind = (
+            mk_raw if mk_raw in _ALLOWED_MILESTONE_KINDS else "crisis_collision"
+        )
+        ts = str(m.get("trigger_state") or "").strip()
+        if not ts:
+            ts = "（须在具体事件中涌现判定）"
+        fb = str(m.get("forbidden_micro_actions") or "").strip()
+        if not fb:
+            fb = (
+                "禁止在 trigger_state 中写入微观姓名、台词、走位、死因现场与唯一动作链；"
+                "禁止写死物证检验/刑侦破解的具体技术路径（笔迹、透印度、化验梗等）；"
+                "由事件引擎与正文涌现。"
+            )
+        cleaned.append(
+            {
+                "milestone_id": mid,
+                "milestone_kind": milestone_kind,
+                "name": name,
+                "trigger_state": ts,
+                "forbidden_micro_actions": fb,
+                "is_volume_closer": bool(m.get("is_volume_closer")),
+            }
+        )
+    if not cleaned:
+        return ensure_milestone_closer_flag(
+            [dict(x) for x in default_milestone_conditions_placeholder()]
+        )
+    return ensure_milestone_closer_flag(cleaned)
 
 
 def _norm_estimated_chapters(raw, index: int) -> int:
@@ -359,13 +418,15 @@ def _norm_estimated_chapters(raw, index: int) -> int:
 
 def _norm_one_volume(data: dict, index: int) -> dict:
     """保证单卷 dict 结构完整，并强制 volume_index。"""
+    _def_te = max(
+        20,
+        DEFAULT_ESTIMATED_CHAPTERS[min(index, len(DEFAULT_ESTIMATED_CHAPTERS) - 1)] // 2,
+    )
     base = {
         "volume_index": index,
         "volume_name": "",
         "volume_direction": "",
-        "estimated_chapters": DEFAULT_ESTIMATED_CHAPTERS[
-            min(index, len(DEFAULT_ESTIMATED_CHAPTERS) - 1)
-        ],
+        "target_events": _def_te,
         "location_scope": "",
         "max_opponent_level": "",
         "conflict_intensity": DEFAULT_CONFLICT_INTENSITY[
@@ -378,7 +439,8 @@ def _norm_one_volume(data: dict, index: int) -> dict:
         "ebd_targets": [],
         "has_detailed_plot": False,
         "arc_track": "",
-        "arc_anchors": [],
+        "volume_macro_conflict": "",
+        "milestone_conditions": [],
         "protagonist_starting_position": {},
         "protagonist_ending_position": {},
         "background_context": {},
@@ -395,13 +457,18 @@ def _norm_one_volume(data: dict, index: int) -> dict:
         out.get("dynamic_gray_factions")
     )
     out.pop("untouchable_characters", None)
+    out.pop("arc_anchors", None)
     if not isinstance(out.get("plot_nodes"), list):
         out["plot_nodes"] = []
     if not isinstance(out.get("ebd_targets"), list):
         out["ebd_targets"] = []
-    # estimated_chapters：兼容新（对象）与旧（整数）格式
+    # target_events：由 LLM estimated_chapters 推导（章估读 → 折半为事件密度）
     raw_ec = out.get("estimated_chapters")
-    out["estimated_chapters"] = _norm_estimated_chapters(raw_ec, index)
+    if raw_ec is None:
+        raw_ec = out.get("target_events")
+    _ch_est = _norm_estimated_chapters(raw_ec, index)
+    out["target_events"] = max(20, min(120, max(1, _ch_est // 2)))
+    out.pop("estimated_chapters", None)
     out["has_detailed_plot"] = bool(out.get("has_detailed_plot"))
     at_raw = out.get("arc_track")
     at = at_raw.strip() if isinstance(at_raw, str) else ""
@@ -409,20 +476,17 @@ def _norm_one_volume(data: dict, index: int) -> dict:
         out["arc_track"] = at if at else "不适用"
     else:
         out["arc_track"] = at
-    # arc_anchors：LLM 未输出时生成默认锚点列表
-    raw_aa = out.get("arc_anchors")
-    if not isinstance(raw_aa, list) or not raw_aa:
-        out["arc_anchors"] = _arc_anchors_default(index)
+    # milestone_conditions：LLM 未输出时默认沙盒里程碑
+    raw_mc = out.get("milestone_conditions")
+    if isinstance(raw_mc, list) and raw_mc:
+        out["milestone_conditions"] = _normalize_milestone_conditions(raw_mc, index)
     else:
-        # 确保 anchor_id 存在且递增，completion_signal 有占位值
-        for idx_a, a in enumerate(raw_aa):
-            if not isinstance(a, dict):
-                raw_aa[idx_a] = {}
-            if not raw_aa[idx_a].get("anchor_id"):
-                raw_aa[idx_a]["anchor_id"] = idx_a + 1
-            if not raw_aa[idx_a].get("completion_signal"):
-                raw_aa[idx_a]["completion_signal"] = "（待补充：此锚点完成的客观可观测标志）"
-        out["arc_anchors"] = raw_aa
+        out["milestone_conditions"] = _normalize_milestone_conditions(None, index)
+    vm = out.get("volume_macro_conflict")
+    if not (isinstance(vm, str) and vm.strip()):
+        out["volume_macro_conflict"] = (
+            out.get("volume_direction") or "（须与本卷矛盾场一致）"
+        )[:500]
     if not isinstance(out.get("protagonist_starting_position"), dict):
         out["protagonist_starting_position"] = {}
     if not isinstance(out.get("protagonist_ending_position"), dict):
@@ -531,6 +595,12 @@ def _volume_snapshot_for_chain(v: dict) -> dict:
         "dynamic_gray_factions": dgf,
         "ebd_targets": v.get("ebd_targets") if isinstance(v.get("ebd_targets"), list) else [],
         "arc_track": (v.get("arc_track") or "") if isinstance(v.get("arc_track"), str) else "",
+        "volume_macro_conflict": (v.get("volume_macro_conflict") or "")
+        if isinstance(v.get("volume_macro_conflict"), str)
+        else "",
+        "milestone_conditions": v.get("milestone_conditions")
+        if isinstance(v.get("milestone_conditions"), list)
+        else [],
     }
 
 
@@ -662,6 +732,7 @@ async def _generate_volumes(
         result = await call_llm_json(
             system=DEEPNOVEL_CONSTITUTION + "\n\n" + f"""
 你是资深网文策划编辑。当前只规划全书 **第 {i + 1}/{NUM_PLAN_VOLUMES} 卷**（volume_index={i}）。
+{_ICEBERG_NON_MANDATORY_RULE}
 须遵守用户消息中的 **进度铁律**：非终卷不得透支终局、不得提前打完 synopsis 里最高层冲突。
 
 **卷间衔接（硬性）**
@@ -679,6 +750,7 @@ async def _generate_volumes(
 {_WORLD_REALISM_CONSTRAINTS}
 {genre_lexicon_block}
 {_VOLUME_JSON_SPEC}
+{_MACRO_BLANK_SPACE_RULE}
 {_ESTIMATED_CHAPTERS_SYSTEM_RULE}
 {ANTI_CLICHE_AND_TEXTURE_RULES}
 数值参考（起评，须服从上文动态铁律）：estimated_chapters 可从 **{default_ch}** 章起评；conflict_intensity 建议 ≥「{prev_ci}」（本卷推荐「{default_ci}」）。
@@ -696,6 +768,7 @@ async def _generate_volumes(
 {arc_direction or "（见 synopsis.direction）"}
 {plot_events_anchor}
 {regen_block}
+{story_arc_brainwave_suffix(state)}
 {_global_pacing_anchor(i, NUM_PLAN_VOLUMES)}
 ## 全书核心阻碍与压迫锚点（须与高位法则作用对象一致）
 {opposition_user}
@@ -778,6 +851,7 @@ async def _enrich_existing_volumes(
 根据小说设定与核心班底，为 **单卷** 补全约束字段：volume_villain、volume_ally、
 dynamic_gray_factions、location_scope、max_opponent_level、conflict_intensity。
 已有非空字段必须保留，不要改用户已写好的卷名、volume_direction、plot_nodes、has_detailed_plot。
+{_ICEBERG_NON_MANDATORY_RULE}
 补全时须遵守用户消息中的 **进度铁律**：非终卷勿把补全写成终局收束；须与**已补全的前序卷**
 在层级与 **dynamic_gray_factions（灰度利益实体）** 递进语义上衔接，勿与同书其它卷冲突。
 随卷收束高位博弈复杂度；**不强制**终局卷清空灰度表——仅当某实体已与主角终局对弈时须调整其 stance；最高掌权者非私人宿敌时可保留为背景位，勿与同书其它卷矛盾。
@@ -788,6 +862,7 @@ dynamic_gray_factions、location_scope、max_opponent_level、conflict_intensity
 {_WORLD_REALISM_CONSTRAINTS}
 输出 **一个** JSON 对象，volume_index={idx}。
 {_VOLUME_JSON_SPEC}
+{_MACRO_BLANK_SPACE_RULE}
 {_ESTIMATED_CHAPTERS_SYSTEM_RULE}
 {ANTI_CLICHE_AND_TEXTURE_RULES}
 只返回 JSON 对象。
@@ -812,6 +887,7 @@ dynamic_gray_factions、location_scope、max_opponent_level、conflict_intensity
 ## 全书走向
 {(synopsis.get("direction") or "").strip() or "（见 synopsis）"}
 
+{story_arc_brainwave_suffix(state) if state is not None else ""}
 ## 全书核心阻碍与压迫锚点（须与高位法则作用对象一致）
 {book_opposition_prompt_block(synopsis, core_cast)}{cast_tail}
 """

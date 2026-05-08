@@ -26,6 +26,7 @@ from utils.genre_lexicon import genre_lexicon_banner
 from utils.llm import call_llm_json
 from utils.volume_fields import format_dynamic_gray_factions_for_prompt
 from utils.karmic_path import normalize_fruit_and_seed
+from utils.path_relay import init_paths_status_from_paths
 
 logger = logging.getLogger("deepnovel.path_gen")
 
@@ -803,9 +804,9 @@ async def path_gen_v43_node(state: CreationState) -> Command:
     # 开篇种子注入：全书首个事件且章节尚未写过时，告知编剧开篇已写完的内容边界
     opening_seed_section = ""
     _seed_text = ((state.get("synopsis") or {}).get("opening_seed_text") or "").strip()
-    _completed = state.get("completed_chapters") or []
+    _gsec = int(state.get("global_settled_event_count", 0) or 0)
     _vol0 = int(state.get("current_volume_index", 0) or 0) == 0
-    _is_first_event = not _completed and _vol0 and event_id.endswith("_001")
+    _is_first_event = _gsec == 0 and _vol0 and event_id.endswith("_001")
     if _seed_text and _is_first_event:
         opening_seed_section = (
             "## 【已写完的开篇正文（硬性边界，禁止重写）】\n\n"
@@ -845,6 +846,7 @@ async def path_gen_v43_node(state: CreationState) -> Command:
         paths = []
     raw["paths"] = paths
     raw["total_paths"] = len(paths)
+    raw.setdefault("scene_exit", "")
 
     # 更新 recent_rhythm：追加本次拆解的路径节奏信息
     existing_rhythm = dict(recent_rhythm) if isinstance(recent_rhythm, dict) else {}
@@ -863,16 +865,26 @@ async def path_gen_v43_node(state: CreationState) -> Command:
         "global_rhythm_adjustment": raw.get("global_rhythm_adjustment", ""),
     }
 
-    # 初始化 path_progress
-    path_ids = [p.get("path_id", "") for p in paths if isinstance(p, dict)]
+    # 初始化 path_progress（补丁 G/H：paths_status + 合并稿占位 + 接力上下文）
+    path_ids = [str(p.get("path_id", "")).strip() for p in paths if isinstance(p, dict)]
+    path_ids = [x for x in path_ids if x]
+    paths_status = init_paths_status_from_paths(paths)
+    if paths_status:
+        paths_status[0]["status"] = "in_progress"
     updated_path_progress = {
         "current_event_id": event_id,
         "completed_paths": [],
         "remaining_paths": path_ids,
+        "paths_status": paths_status,
+        "all_paths_text": "",
+        "write_relay_context": "",
+        "last_path_state_extract": {},
+        "pending_inner_stream_chunks": [],
     }
 
     node_done(f"叙事拆解完成：{event_name} → {len(paths)} 个路径")
 
+    next_goto = "auto_review" if state.get("auto_mode") else "human_review_path"
     return Command(
         update={
             "current_event_paths": raw,
@@ -880,5 +892,5 @@ async def path_gen_v43_node(state: CreationState) -> Command:
             "path_progress": updated_path_progress,
             "pending_review_type": "path",
         },
-        goto="human_review_path",
+        goto=next_goto,
     )

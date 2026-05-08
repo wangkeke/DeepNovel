@@ -39,6 +39,10 @@ from config import DB_PATH
 from utils.mental_core import normalize_mental_core_dict
 from utils.protagonist_card_normalize import normalize_protagonist_card_for_state
 from prompts.creation.world_build import CHAR_CARD_DRAFT_SYSTEM, CHAR_CARD_DRAFT_USER_TEMPLATE
+from prompts.creation.narrative_memory import CONSOLIDATION_SYSTEM, CONSOLIDATION_USER
+from utils.narrative_memory import ensure_memory_streams
+from utils.text_metrics import prose_char_count
+from utils.path_relay import effective_chapter_draft
 import logging
 import uuid as _uuid
 
@@ -589,7 +593,7 @@ async def _save_chapter_to_db(
             """INSERT OR REPLACE INTO chapters
                (chapter_id, project_id, node_id, seq, node_name, content, word_count)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (chapter_id, project_id, node_id, seq, node_name, content, len(content)),
+            (chapter_id, project_id, node_id, seq, node_name, content, prose_char_count(content)),
         )
         await conn.commit()
 
@@ -619,6 +623,169 @@ async def _update_project_summary(
         await conn.commit()
 
 
+def _resolve_bible_character_key(raw_name: str, bible_characters: dict) -> str:
+    """
+    将 path_state_extract 提供的 character_name 对齐到 bible.characters 的真实 dict 键。
+    优先键精确匹配，再比 standard_name / name / aliases（全相等，避免跨名误绑）。
+    若无匹配则退回原串（新角可由上游后续补卡）。
+    """
+    raw = (raw_name or "").strip()
+    if not raw:
+        return ""
+    if not isinstance(bible_characters, dict):
+        return raw
+    if raw in bible_characters:
+        return raw
+    for k, v in bible_characters.items():
+        if not isinstance(v, dict):
+            continue
+        sk = str(k).strip()
+        if not sk:
+            continue
+        sn = str(v.get("standard_name") or "").strip()
+        vn = str(v.get("name") or "").strip()
+        if raw == sk:
+            return sk
+        if sn and raw == sn:
+            return sk
+        if vn and raw == vn:
+            return sk
+        for al in v.get("aliases") or []:
+            if raw == str(al).strip():
+                return sk
+    return raw
+
+
+def _character_name_hits_draft(card: dict, dict_key: str, draft: str) -> bool:
+    """事件结算时判断该 bible 角色是否在正文中出场（弱匹配：任一常用名字段为子串）。"""
+    if not (draft or "").strip():
+        return True
+    cand: set[str] = set()
+    for fld in ("standard_name", "name"):
+        v = card.get(fld)
+        if v is not None and str(v).strip():
+            cand.add(str(v).strip())
+    if dict_key.strip():
+        cand.add(dict_key.strip())
+    if not cand:
+        return False
+    d = draft
+    return any(n in d for n in cand if len(n) >= 1)
+
+
+async def _apply_patch_i_chapter_narrative_memory(
+    state: CreationState,
+    project_id: str,
+    global_seq: int,
+    *,
+    event_boundary_flush: bool = False,
+    chapter_draft: str = "",
+) -> dict[str, dict]:
+    """
+    补丁 I §四：pending_inner_stream_chunks → short_term；（仅事件末拍）short_term + 近期 long
+    → LLM 合并 → long_term，并强制清空 short_term。
+    多路径下同事件只在本事件最后一条路径收尾时做固化，避免短栈被提前清空。
+    """
+    pp = dict(state.get("path_progress") or {}) if isinstance(state.get("path_progress"), dict) else {}
+    chunks = list(pp.get("pending_inner_stream_chunks") or [])
+    bible = state.get("bible") or {}
+    chars_map = bible.get("characters") or {}
+    if not isinstance(chars_map, dict):
+        chars_map = {}
+    base: dict[str, dict] = {
+        str(k): ensure_memory_streams(dict(v))
+        for k, v in chars_map.items()
+        if isinstance(v, dict) and str(k).strip()
+    }
+    if not chunks and not base:
+        return {}
+
+    for ch in chunks:
+        if not isinstance(ch, dict):
+            continue
+        raw_nm = str(ch.get("character_name") or "").strip()
+        sl = str(ch.get("inner_slice") or "").strip()
+        if not raw_nm or not sl:
+            continue
+        nm = _resolve_bible_character_key(raw_nm, chars_map)
+        if not nm:
+            continue
+        if nm not in base:
+            base[nm] = ensure_memory_streams({"standard_name": raw_nm, "name": raw_nm})
+        card = base[nm]
+        st = list(card.get("short_term_stream") or [])
+        st.append(sl)
+        card["short_term_stream"] = st[-40:]
+
+    if event_boundary_flush and chapter_draft.strip():
+        seen: set[str] = set(base.keys())
+        for k, v in (bible.get("characters") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            key = str(k).strip()
+            if not key:
+                continue
+            card0 = ensure_memory_streams(dict(v))
+            if _character_name_hits_draft(card0, key, chapter_draft) and key not in seen:
+                base[key] = card0
+                seen.add(key)
+
+    if not event_boundary_flush:
+        return base
+
+    for nm, card in list(base.items()):
+        st = list(card.get("short_term_stream") or [])
+        if not st:
+            continue
+        # 事件边界上不再依赖正文命中：Stub/极短梗概会导致名字匹配失败、long_term 永不合。
+        # 凡本事件已累计的 short_term_stream，一律做固化合并（若有正文且明确未出场可再收紧，见上「扩展出场」逻辑）。
+        lt_full = list(card.get("long_term_stream") or [])
+        recent = lt_full[-3:] if lt_full else []
+        long_term_recent = (
+            "\n".join(f"- {s}" for s in recent)
+            if recent
+            else "（尚无既往长篇自传条目。）"
+        )
+        slices_text = "\n".join(f"- {i + 1}. {s}" for i, s in enumerate(st))
+        memoir = ""
+        try:
+            raw = await call_llm_json(
+                CONSOLIDATION_SYSTEM,
+                CONSOLIDATION_USER.format(
+                    character_name=nm,
+                    long_term_recent=long_term_recent,
+                    slices_text=slices_text,
+                ),
+                max_tokens=700,
+            )
+            if isinstance(raw, dict):
+                memoir = str(raw.get("event_memoir") or "").strip()
+        except Exception as e:
+            logger.warning("事件记忆固化失败 (%s): %s", nm, e)
+        card["short_term_stream"] = []
+        if memoir and memoir != "无":
+            lt = list(card.get("long_term_stream") or [])
+            lt.append(memoir)
+            card["long_term_stream"] = lt[-200:]
+            if project_id:
+                try:
+                    ent_nm = (
+                        str(card.get("standard_name") or card.get("name") or nm).strip() or nm
+                    )
+                    await upsert_entity_card(
+                        project_id,
+                        "character",
+                        ent_nm,
+                        {"long_term_stream": [memoir]},
+                        seq=global_seq,
+                    )
+                except Exception as e:
+                    logger.warning("long_term_stream 入库失败 (%s): %s", nm, e)
+        base[nm] = card
+
+    return base
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main node
 # ──────────────────────────────────────────────────────────────────────────────
@@ -626,7 +793,8 @@ async def _update_project_summary(
 async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
     writer({"node_status": "started", "node": "bible_update"})
 
-    draft       = state.get("current_draft", "")
+    # 与 narrative_extract 对齐：v4.3 多路径下 current_draft 可能被清空，合并稿在 all_paths_text
+    draft       = effective_chapter_draft(state)
     current_idx = state.get("current_node_index", 0)
     story_path  = state.get("story_path", [])
     project_id  = state.get("project_id", "")
@@ -923,16 +1091,25 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
             logger.critical(f"_update_project_summary 失败 (project={project_id}): {e}")
 
         # ── Step 7: 写入 chapters + story_nodes ──
-        try:
-            await _save_chapter_to_db(
-                project_id=project_id,
-                seq=global_seq,
-                node_name=node_name,
-                content=draft,
-                event_path_chain=state.get("pending_event_path_chain", []),
+        if (draft or "").strip():
+            try:
+                await _save_chapter_to_db(
+                    project_id=project_id,
+                    seq=global_seq,
+                    node_name=node_name,
+                    content=draft,
+                    event_path_chain=state.get("pending_event_path_chain", []),
+                )
+            except Exception as e:
+                logger.critical(f"_save_chapter_to_db 失败 (project={project_id}, seq={global_seq}): {e}")
+        else:
+            logger.critical(
+                "bible_update：current_draft 为空，已跳过 chapters 持久化 "
+                "(project=%s seq=%s node=%s)，避免写入空 content；请上游排查 write/路由。",
+                project_id,
+                global_seq,
+                node_name,
             )
-        except Exception as e:
-            logger.critical(f"_save_chapter_to_db 失败 (project={project_id}, seq={global_seq}): {e}")
 
         # ── Step 8: 保存用户确认的人物卡草稿 ──
         confirmed_char_cards = state.get("confirmed_char_cards", [])
@@ -993,7 +1170,6 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
             current_role   = "中立"
             established_seq = 0
             try:
-                from memory.entity_db import get_character_cards_with_tendencies
                 cards = await get_character_cards_with_tendencies(project_id, [char_name])
                 if cards:
                     data = cards[0]
@@ -1309,6 +1485,17 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
         set(existing_collected + result.get("collected_foreshadows", []))
     )
 
+    _pp_mem = state.get("path_progress") or {}
+    _rem = list(_pp_mem.get("remaining_paths") or []) if isinstance(_pp_mem, dict) else []
+    _event_boundary_flush = len(_rem) == 0
+    memory_chars_patch = await _apply_patch_i_chapter_narrative_memory(
+        state,
+        project_id or "",
+        global_seq,
+        event_boundary_flush=_event_boundary_flush,
+        chapter_draft=draft or "",
+    )
+
     # 合并 bible 并清除本章修改反馈，防止跨章污染
     merged_bible = {
         **state.get("bible", {}),
@@ -1316,6 +1503,13 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
         "rewrite_feedback":        "",
         "rewrite_feedback_parsed": {},
     }
+    if memory_chars_patch:
+        mch = dict(merged_bible.get("characters") or {})
+        for k, v in memory_chars_patch.items():
+            prev_c = dict(mch[k]) if isinstance(mch.get(k), dict) else {}
+            inc_c = dict(v) if isinstance(v, dict) else {}
+            mch[k] = {**prev_c, **inc_c}
+        merged_bible["characters"] = mch
 
     ledger = result.get("karmic_ledger_updates")
     if isinstance(ledger, dict):
@@ -1348,13 +1542,51 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
             :20
         ]
 
-    # ── v4.3 双循环控制 ──────────────────────────────────────────────────────────
-    loop_control = _compute_v43_loop_control(state, merged_bible)
+    # ── v4.3 双循环控制：先推进路径再判定内外循环（末条路径不得误判为「内循环未完成」）
+    _pp_merged = dict(state.get("path_progress") or {}) if isinstance(state.get("path_progress"), dict) else {}
+    _pp_merged["pending_inner_stream_chunks"] = []
+    _adv_pp = _advance_path_progress(state)
+    _sim_pp = dict(_pp_merged)
+    if _adv_pp:
+        _sim_pp.update(_adv_pp)
+    state_for_loop: dict = dict(state)
+    state_for_loop["path_progress"] = _sim_pp
+    loop_control = _compute_v43_loop_control(state_for_loop, merged_bible, draft_for_count=draft)
+    if _adv_pp:
+        _pp_merged.update(_adv_pp)
+    _all_txt = (state.get("all_paths_text") or draft or "").strip()
+    if _all_txt:
+        _pp_merged["cumulative_prose_tail"] = _all_txt[-400:]
+    updated_path_progress = _pp_merged
 
-    # 更新 path_progress：标记当前 path 为完成
-    updated_path_progress = _advance_path_progress(state)
+    settle_extras: dict = {}
+    if loop_control.get("inner_loop_complete"):
+        gsec = int(state.get("global_settled_event_count", 0) or 0)
+        settle_extras["global_settled_event_count"] = gsec + 1
+        ce = state.get("current_event") if isinstance(state.get("current_event"), dict) else {}
+        ent = ce.get("_settlement_summary_entry") if isinstance(ce, dict) else None
+        if isinstance(ent, dict) and str(ent.get("event_id") or "").strip():
+            settle_extras["completed_events_summary"] = [dict(ent)]
+        elif isinstance(ce, dict) and str(ce.get("event_id") or "").strip():
+            _cc = ce.get("causal_chain") if isinstance(ce.get("causal_chain"), dict) else {}
+            _pt = ce.get("protagonist_tick") if isinstance(ce.get("protagonist_tick"), dict) else {}
+            _ecore = ce.get("event_core") if isinstance(ce.get("event_core"), dict) else {}
+            settle_extras["completed_events_summary"] = [
+                {
+                    "event_id": str(ce.get("event_id") or "").strip(),
+                    "event_name": ce.get("event_name", "（未命名）"),
+                    "conflict_type": _ecore.get("conflict_type", ""),
+                    "primary_resource_used": _ecore.get("primary_resource_used", ""),
+                    "event_result_type": str(_cc.get("event_result_type") or "").strip(),
+                    "protagonist_tick_type": str(_pt.get("protagonist_tick_type") or "").strip(),
+                    "milestone_touched": None,
+                }
+            ]
     # 将 narrative_extract 的 actual_chain 追加到 path_progress 供后续参考
     ne_result = state.get("narrative_extract_result") or {}
+    ne_snap = ne_result.get("scene_snapshot") or {}
+    if not isinstance(ne_snap, dict):
+        ne_snap = {}
     ne_path_chain = ne_result.get("chapter_path_chain") or {}
     if ne_path_chain and isinstance(updated_path_progress, dict):
         history = list(updated_path_progress.get("actual_chain_history") or [])
@@ -1367,8 +1599,8 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
         })
         updated_path_progress["actual_chain_history"] = history[-20:]  # 保留最近20章
 
-    # 更新 anchor_progress（v4.3 完成信号检查在 event_chain_gen 负责；此处只同步章节完成）
-    updated_anchor_progress = state.get("anchor_progress") or {}
+    # 里程碑 / 锚点进度（event_chain_gen 更新；此处透传，双写兼容旧 checkpoint）
+    _prog = dict(state.get("milestone_progress") or {})
 
     # ── 主角精神层面动态回写 ──────────────────────────────────────────────────────
     # 若 entity_updates 中包含主角，将 current_mental_state / mental_status_note 同步到
@@ -1404,7 +1636,6 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
     base_update = {
         "bible":                          merged_bible,
         "karmic_ledger":                  _state_karmic_ledger_from_merged_bible(merged_bible),
-        "completed_chapters":             [draft],
         "current_node_index":             current_idx + 1,
         "confirmed_char_cards":           [],
         "pending_char_cards":             [],
@@ -1415,6 +1646,7 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
         "pending_noun_foreshadows":        [],
         "noun_foreshadow_story_potential_edits": {},
         "narrative_extract_result":        {},
+        "scene_snapshot":                  ne_snap if ne_snap else state.get("scene_snapshot") or {},
         "world_lexicon":                   current_world_lexicon,
         "active_quest_stack":              current_active_quest_stack,
         "last_action_intent":             last_action_intent_val if project_id else "",
@@ -1424,9 +1656,10 @@ async def bible_update_node(state: CreationState, writer: StreamWriter) -> dict:
         # v4.3 新增
         "loop_control":                   loop_control,
         "path_progress":                  updated_path_progress,
-        "anchor_progress":                updated_anchor_progress,
+        "milestone_progress":             _prog,
         # 主角精神层面动态回写
         **({"protagonist_archive": updated_protagonist_archive} if updated_protagonist_archive else {}),
+        **settle_extras,
     }
 
     # 若有卷收束摘要（trigger_arc_end），附加到 state
@@ -1463,53 +1696,141 @@ def _advance_path_progress(state: CreationState) -> dict:
     }
 
 
-def _compute_v43_loop_control(state: CreationState, merged_bible: dict) -> dict:
+def _volume_target_events(vol: dict) -> int:
+    """本卷目标事件数（规划字段 target_events；缺省 30）。"""
+    if not isinstance(vol, dict):
+        return 30
+    try:
+        te = int(vol.get("target_events", 0) or 0)
+    except (TypeError, ValueError):
+        te = 0
+    if te > 0:
+        return max(1, te)
+    return 30
+
+
+# 沙盒压测：与 volumes[].target_events 取 min，压低后仍满足「事件计数」语义（非章节表）
+_SANDBOX_ARC_TARGET_EVENTS_CAP = 12
+
+
+def _compute_v43_loop_control(
+    state: CreationState,
+    merged_bible: dict,
+    *,
+    draft_for_count: str = "",
+) -> dict:
     """
-    计算 v4.3 双循环控制决策：
-    1. 内循环：path_progress.remaining_paths 是否还有路径
-       - 有：inner_loop_action = "continue_inner_loop"
-       - 无：inner_loop_complete = True，进入外循环检查
-    2. 外循环（内循环完成后）：
-       - 检查 anchor_progress 是否全部完成
-       - 检查 completed_chapters 数量 >= 50
-       - 输出 outer_loop_action: continue_event_loop | trigger_arc_end
+    计算 v4.3 双循环控制决策（path_progress 须为已 advance 后的快照）：
+    1. 内循环：path_progress.remaining_paths 是否非空
+    2. 外循环（内循环完成后）：本卷已完结事件数 vs volumes[].target_events；
+       里程碑全清且事件数≥80% 目标 → trigger_arc_end；≥120% → 强制收卷。
+
+    计数器说明（与章节表无关）：「本卷事件数」= global_settled_event_count + 1
+    （本笔结算）− volume_start_event_count（卷起点基准）；见 volume_events_after。
+    沙盒可设 state["_sandbox_arc_relaxed"]，将参与阈值的 target_events 上限压到
+    `_SANDBOX_ARC_TARGET_EVENTS_CAP`，便于在少量事件内走通 auto_arc_transition。
     """
     path_progress = state.get("path_progress") or {}
     remaining_paths = list(path_progress.get("remaining_paths") or [])
 
-    # 排除掉当前正在处理的（第一个），因为 _advance_path_progress 已经处理它
-    # 这里只检查"还有没有下一个路径"
-    next_paths_after_current = remaining_paths[1:] if len(remaining_paths) > 1 else []
+    sandbox_arc_relaxed = bool(state.get("_sandbox_arc_relaxed"))
+    gsec = int(state.get("global_settled_event_count", 0) or 0)
+    vsec = int(state.get("volume_start_event_count", 0) or 0)
+    volume_events_after = max(0, gsec + 1 - vsec)
+    vol_index = int(state.get("current_volume_index", 0) or 0)
+    volumes = state.get("volumes") or []
 
-    # ── 内循环判断 ──
-    if next_paths_after_current:
-        # 还有路径未处理，继续内循环
-        next_path_id = next_paths_after_current[0] if next_paths_after_current else ""
-        return {
+    if len(remaining_paths) > 0:
+        next_path_id = str(remaining_paths[0] or "").strip()
+        out = {
             "inner_loop_complete": False,
             "inner_loop_action": "continue_inner_loop",
             "next_path_id": next_path_id,
         }
+        logger.debug(
+            "bible_update v4.3 loop_control_diag %s",
+            json.dumps(
+                {
+                    "branch": "inner_incomplete",
+                    "sandbox_arc_relaxed": sandbox_arc_relaxed,
+                    "loop_control": out,
+                    "remaining_paths_head": remaining_paths[:5],
+                    "remaining_paths_count": len(remaining_paths),
+                    "global_settled_event_count": gsec,
+                    "volume_start_event_count": vsec,
+                    "volume_events_after_this_settlement": volume_events_after,
+                    "current_volume_index": vol_index,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return out
 
-    # ── 内循环完成，进入外循环判断 ──
-    anchor_progress = state.get("anchor_progress") or {}
-    pending_anchors = anchor_progress.get("pending", [])
-    completed_anchors = anchor_progress.get("completed", [])
-    anchor_all_complete = len(pending_anchors) == 0 and len(completed_anchors) > 0
+    mp = state.get("milestone_progress") or {}
+    pending = list(mp.get("pending") or [])
+    completed = list(mp.get("completed") or [])
+    milestone_all_complete = len(pending) == 0 and len(completed) > 0
 
-    completed_chapters = state.get("completed_chapters") or []
-    chapter_count = len(completed_chapters)
-    chapter_count_sufficient = chapter_count >= 50
+    if volumes and vol_index < len(volumes):
+        target_events_raw = _volume_target_events(
+            volumes[vol_index] if isinstance(volumes[vol_index], dict) else {}
+        )
+    else:
+        target_events_raw = 30
+    target_events = max(1, int(target_events_raw))
+    if sandbox_arc_relaxed:
+        target_events = max(5, min(target_events, _SANDBOX_ARC_TARGET_EVENTS_CAP))
 
-    if anchor_all_complete and chapter_count_sufficient:
-        # 触发卷收束
-        synopsis = state.get("synopsis") or {}
+    th_normal = target_events * 0.8
+    th_forced = target_events * 1.2
+    normal_ready = milestone_all_complete and volume_events_after >= th_normal
+    forced_ready = volume_events_after >= th_forced
+
+    trigger_arc = False
+    if normal_ready:
+        trigger_arc = True
+        logger.info(
+            "bible_update v4.3：卷收束触发(正常) 里程碑全清且本卷事件数≥80%% 阈值 "
+            "vol=%s milestones=%s 本卷事件=%s/%s",
+            vol_index,
+            len(completed),
+            volume_events_after,
+            target_events,
+        )
+    elif forced_ready:
+        trigger_arc = True
+        logger.warning(
+            "bible_update v4.3：卷收束触发(强制) 事件数≥120%% 阈值（里程碑状态不阻塞） "
+            "vol=%s pending_milestones=%s 本卷事件=%s/%s",
+            vol_index,
+            len(pending),
+            volume_events_after,
+            target_events,
+        )
+
+    diag_common = {
+        "branch": "outer_eval",
+        "sandbox_arc_relaxed": sandbox_arc_relaxed,
+        "counter_note": "volume_events_after = global_settled_event_count + 1 - volume_start_event_count（章节行数不参与）",
+        "global_settled_event_count": gsec,
+        "volume_start_event_count": vsec,
+        "volume_events_after_this_settlement": volume_events_after,
+        "current_volume_index": vol_index,
+        "target_events_raw": int(target_events_raw),
+        "target_events_effective": target_events,
+        "threshold_normal_80pct": th_normal,
+        "threshold_forced_120pct": th_forced,
+        "milestone_pending": pending,
+        "milestone_completed": completed,
+        "milestone_all_complete": milestone_all_complete,
+        "normal_path_ready": normal_ready,
+        "forced_path_ready": forced_ready,
+    }
+
+    if trigger_arc:
         protagonist_archive = state.get("protagonist_archive") or state.get("protagonist_card") or {}
-        volumes = state.get("volumes") or []
-        vol_index = int(state.get("current_volume_index", 0) or 0)
-        current_vol = volumes[vol_index] if vol_index < len(volumes) else {}
+        current_vol = volumes[vol_index] if volumes and vol_index < len(volumes) else {}
 
-        # 收集未触发的因果种子（open_seeds）
         karmic_inventory = merged_bible.get("karmic_seeds_inventory") or []
         harvested_log = merged_bible.get("karmic_seeds_harvested_log") or []
         harvested_ids = {h.get("seed_id") for h in harvested_log if isinstance(h, dict)}
@@ -1517,13 +1838,13 @@ def _compute_v43_loop_control(state: CreationState, merged_bible: dict) -> dict:
             {"seed_id": s.get("seed_id"), "description": s.get("description", s.get("surface_meaning", ""))}
             for s in karmic_inventory
             if isinstance(s, dict) and s.get("seed_id") not in harvested_ids
-        ][-10:]  # 最多展示10个
+        ][-10:]
 
         arc_completion_summary = {
             "volume_index": vol_index,
             "volume_name": current_vol.get("volume_name", ""),
-            "anchors_completed": completed_anchors,
-            "total_chapters_in_volume": chapter_count,
+            "milestones_completed": completed,
+            "total_events_in_volume": volume_events_after,
             "open_seeds": open_seeds,
             "protagonist_state_at_end": {
                 "name": protagonist_archive.get("standard_name", "") or state.get("protagonist_name", ""),
@@ -1533,27 +1854,29 @@ def _compute_v43_loop_control(state: CreationState, merged_bible: dict) -> dict:
             "volume_direction_achieved": current_vol.get("volume_direction", ""),
         }
 
-        logger.info(
-            "bible_update v4.3：卷 %s 收束触发（%s 个锚点完成，%s 章）",
-            vol_index,
-            len(completed_anchors),
-            chapter_count,
-        )
-
-        return {
+        out_trigger = {
             "inner_loop_complete": True,
             "outer_loop_action": "trigger_arc_end",
             "arc_completion_summary": arc_completion_summary,
         }
+        logger.info(
+            "bible_update v4.3 loop_control_diag %s",
+            json.dumps({**diag_common, "loop_control": out_trigger}, ensure_ascii=False),
+        )
+        return out_trigger
 
-    # 锚点未全完成或章节数不足，继续事件循环
-    return {
+    out_continue = {
         "inner_loop_complete": True,
         "outer_loop_action": "continue_event_loop",
-        "pending_anchors_count": len(pending_anchors),
-        "chapter_count": chapter_count,
+        "pending_milestones_count": len(pending),
+        "volume_event_count": gsec,
+        "current_volume_event_count": volume_events_after,
     }
-
+    logger.info(
+        "bible_update v4.3 loop_control_diag %s",
+        json.dumps({**diag_common, "loop_control": out_continue}, ensure_ascii=False),
+    )
+    return out_continue
 
 def _bible_update_v43_routing(state: CreationState) -> str:
     """
@@ -1569,7 +1892,11 @@ def _bible_update_v43_routing(state: CreationState) -> str:
     # 外循环：继续事件循环
     outer_action = loop_control.get("outer_loop_action", "continue_event_loop")
     if outer_action == "trigger_arc_end":
-        return "human_review_batch"  # 或 story_arc_plan，由人工决策
+        auto_mode = state.get("auto_mode", False)
+        auto_target = (state.get("auto_target") or "book").strip().lower()
+        if auto_mode and auto_target in ("arc", "book"):
+            return "auto_arc_transition"
+        return "human_review_batch"
 
     # 默认：继续事件循环（生成下一个事件）
     return "event_chain_gen"

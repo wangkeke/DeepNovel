@@ -30,6 +30,12 @@ from graph.creation.genesis_merge import (
     protagonist_name_from_cast_local,
 )
 from graph.creation.iceberg_anchor import format_iceberg_anchor_block
+from utils.brainwave_engine import (
+    brainwave_engine_from_state,
+    brainwave_prompt_block,
+    quest_dict_from_brainwave,
+    strip_brainwave_and_collision_immediate,
+)
 from utils.v42_flow import (
     protagonist_archive_prompt_block,
     shallow_world_archive,
@@ -251,7 +257,7 @@ async def iceberg_deduction_node(state: CreationState, writer: StreamWriter) -> 
             variables_block=vb,
             genre_request=genre_request,
             extra_feedback=extra or "（无）",
-        )
+        ) + brainwave_prompt_block(state)
         raw_p4 = await call_llm_json(
             ICEBERG_PROMPT4_SYSTEM + demo_block + texture_block,
             p4_user,
@@ -287,12 +293,12 @@ async def iceberg_deduction_node(state: CreationState, writer: StreamWriter) -> 
             anchor_block=anchor_block,
             variables_block=vb,
             opening_text=opening,
-        ) + rules_anchor_str + prompt4_chain_block
+        ) + rules_anchor_str + prompt4_chain_block + brainwave_prompt_block(state)
         c_user = ICEBERG_STAGE1_CAST_USER.format(
             anchor_block=anchor_block,
             variables_block=vb,
             opening_text=opening,
-        ) + chars_anchor_str + protagonist_name_lock + prompt4_chain_block
+        ) + chars_anchor_str + protagonist_name_lock + prompt4_chain_block + brainwave_prompt_block(state)
         world_raw, cast_raw = await asyncio.gather(
             call_llm_json(ICEBERG_STAGE1_WORLD_SYSTEM + demo_block + texture_block, w_user),
             call_llm_json(ICEBERG_STAGE1_CAST_SYSTEM + demo_block + texture_block, c_user),
@@ -316,7 +322,7 @@ async def iceberg_deduction_node(state: CreationState, writer: StreamWriter) -> 
         world_json=json.dumps(world_raw, ensure_ascii=False, indent=2),
         cast_json=json.dumps(cast_raw, ensure_ascii=False, indent=2),
         extra_feedback=extra or "（无）",
-    ) + emo_anchor_str
+    ) + emo_anchor_str + brainwave_prompt_block(state)
     stage2 = await call_llm_json(sys2, user2)
     if not isinstance(stage2, dict):
         stage2 = {}
@@ -328,7 +334,9 @@ async def iceberg_deduction_node(state: CreationState, writer: StreamWriter) -> 
     if can_synopsis_only:
         merged_world = dict(state.get("world_setting") or {})
         if not merged_world:
-            merged_world = world_setting_from_iceberg(world_raw, genre_request)
+            merged_world = world_setting_from_iceberg(
+                world_raw, genre_request, state.get("world_setting") or {}
+            )
         ex0 = _existing_protagonist_for_iceberg(state)
         protagonist_card = dict(ex0) if ex0 else dict(state.get("genesis_protagonist_card") or {})
         if not protagonist_card.get("standard_name"):
@@ -357,7 +365,9 @@ async def iceberg_deduction_node(state: CreationState, writer: StreamWriter) -> 
                 pc_ice, existing_card=_existing or (protagonist_card if protagonist_card.get("standard_name") else None)
             )
     else:
-        merged_world = world_setting_from_iceberg(world_raw, genre_request)
+        merged_world = world_setting_from_iceberg(
+            world_raw, genre_request, state.get("world_setting") or {}
+        )
         pc_ice = (
             cast_raw.get("protagonist_card")
             if isinstance(cast_raw.get("protagonist_card"), dict)
@@ -391,9 +401,20 @@ async def iceberg_deduction_node(state: CreationState, writer: StreamWriter) -> 
         node_done("宏观构思已按意见重算（世界与班底与已确认稿一致）")
     else:
         node_done("冰山反推草案已就绪")
-    # 从 PROMPT4 开篇碰撞提取初始任务推入任务栈
-    existing_stack = list(state.get("active_quest_stack") or [])
+    # 从 PROMPT4 开篇碰撞提取初始任务；若无则回退脑洞引擎 first_quest（补丁 E）
+    existing_stack = strip_brainwave_and_collision_immediate(
+        list(state.get("active_quest_stack") or [])
+    )
     updated_stack = _extract_initial_quests_from_prompt4(prompt4_raw, existing_stack)
+    if not any(
+        isinstance(q, dict)
+        and q.get("layer") == "immediate"
+        and q.get("planted_chapter") == "opening_collision"
+        for q in updated_stack
+    ):
+        bq = quest_dict_from_brainwave(brainwave_engine_from_state(state))
+        if bq:
+            updated_stack = list(updated_stack) + [bq]
 
     payload_update = {
         "iceberg_review_payload": review_payload,

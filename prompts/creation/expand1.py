@@ -290,7 +290,7 @@ logic_analysis 必填，每人至少一条（无主导逻辑的人物可填 oppo
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# v4.3 路径落地确认提示词（PROMPT 8 修订版）
+# v4.3 路径落地确认提示词（PROMPT 8）
 # 三步：状态确认 → 叙事功能确认 → 因果咬合
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -328,7 +328,7 @@ EXPAND1_V43_SYSTEM = DEEPNOVEL_CONSTITUTION + "\n\n" + """你是一位**章节�
 """
 
 EXPAND1_V43_USER_TEMPLATE = """\
-{quest_motivation_section}## 路径定义（来自 path_gen，不得擅自修改核心设定）
+{quest_motivation_section}{narrative_memory_pov_section}## 路径定义（来自 path_gen，不得擅自修改核心设定）
 {path_definition}
 
 ## 世界档案（world_archive · 当前真实状态）

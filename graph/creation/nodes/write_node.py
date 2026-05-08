@@ -12,7 +12,18 @@ from __future__ import annotations
 import logging
 from langgraph.types import StreamWriter
 from schemas.state import CreationState
-from prompts.creation.write import WRITE_SYSTEM, WRITE_USER_TEMPLATE
+from prompts.common.era_lexicon_filter import era_lexicon_system_suffix
+from prompts.creation.write import (
+    WRITE_SYSTEM,
+    WRITE_USER_TEMPLATE,
+    PATCH_F_WRITE_PATH_INTEGRITY_RULES,
+    PATCH_F_WRITE_PATH_WORDCOUNT,
+    PATCH_G_SINGLE_PATH_IRON,
+    PATCH_G_SINGLE_PATH_WORDCOUNT,
+    PATCH_G_SINGLE_PATH_CHAIN_TEMPLATE,
+    get_platform_path_filter_block,
+)
+from utils.path_relay import get_current_v43_path_def, v43_chapter_display_name
 from prompts.creation.world_build import CHAR_CARD_DRAFT_SYSTEM, CHAR_CARD_DRAFT_USER_TEMPLATE
 from utils.llm import call_llm, call_llm_json
 from memory.entity_db import get_all_ability_names
@@ -31,15 +42,17 @@ from prompts.creation.platform_styles import (
 )
 from prompts.common.variable_elasticity import VARIABLE_ELASTICITY_RULE_BLOCK
 from utils.v42_flow import protagonist_archive_prompt_block
+from utils.narrative_memory import build_narrative_memory_pov_section
 
 logger = logging.getLogger(__name__)
-
 
 def _format_world_setting_section(world_setting: dict) -> str:
     """将世界设定卡格式化为 prompt 前缀段落（静态背景宪法）。"""
     if not world_setting:
         return ""
     lines = ["## 世界设定（全书宪法，写作必须遵守）\n"]
+    if ne := str(world_setting.get("narrative_era") or "").strip():
+        lines.append(f"叙事时代与语体：{ne}")
     if br := world_setting.get("basic_rules"):
         lines.append(f"基础规则：{br}")
     gz = world_setting.get("gray_zone_ecology", [])
@@ -167,7 +180,9 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
     current_idx = state.get("current_node_index", 0)
     story_path  = state.get("story_path", [])
     current_node = story_path[current_idx] if current_idx < len(story_path) else {}
-    node_name    = current_node.get("node_name", f"章节_{current_idx}")
+    node_name = current_node.get("node_name", f"章节_{current_idx}")
+    if state.get("current_event_paths"):
+        node_name = v43_chapter_display_name(state)
 
     # 平台风格
     platform = state.get("platform_style", "通用网文")
@@ -219,12 +234,38 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
         "\n".join(plant_instructions) if plant_instructions else "无特定伏笔任务"
     )
 
-    # 一致性违规（重写时传入）
-    consistency_violations = state.get("consistency_result", {}).get("violations", [])
-    if isinstance(consistency_violations, list):
-        violations_text = "、".join(consistency_violations) if consistency_violations else "无（首稿）"
+    # 一致性违规 / 修订焦点（重写时传入；兼容旧 JSON 与新 verdict 结构）
+    cr = state.get("consistency_result") or {}
+    if isinstance(cr, dict) and (
+        cr.get("verdict") == "revise"
+        or (cr.get("passed") is False and not cr.get("is_pivot"))
+    ):
+        focus = (cr.get("revision_focus") or "").strip()
+        rd = (cr.get("routing_decision") or "").strip()
+        parts = []
+        if focus:
+            parts.append(focus)
+        phys = cr.get("physical_consistency") or {}
+        narr = cr.get("narrative_consistency") or {}
+        if isinstance(phys, dict):
+            for k in ("spatial_issue", "asset_issue", "cliffhanger_issue"):
+                v = (phys.get(k) or "").strip()
+                if v and v.lower() not in ("null", "无", "na"):
+                    parts.append(v[:200])
+        if isinstance(narr, dict):
+            for k in ("lexicon_issue", "quest_issue", "character_issue"):
+                v = (narr.get(k) or "").strip()
+                if v and v.lower() not in ("null", "无"):
+                    parts.append(v[:200])
+        if rd:
+            parts.append(f"（建议回流节点：{rd}）")
+        violations_text = "；".join(parts) if parts else "（一致性修订：见 revision_focus）"
     else:
-        violations_text = str(consistency_violations) if consistency_violations else "无（首稿）"
+        consistency_violations = cr.get("violations", []) if isinstance(cr, dict) else []
+        if isinstance(consistency_violations, list):
+            violations_text = "、".join(consistency_violations) if consistency_violations else "无（首稿）"
+        else:
+            violations_text = str(consistency_violations) if consistency_violations else "无（首稿）"
 
     # 上一版修改意见（auto_review 或人工回退时注入，如对话占比不足等）
     rewrite_feedback = (state.get("bible", {}) or {}).get("rewrite_feedback", "").strip()
@@ -234,11 +275,17 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
     )
 
     # 创世开篇种子：全书首个写作节点须正文衔接，禁止另起炉灶
-    completed = state.get("completed_chapters", [])
+    gsec = int(state.get("global_settled_event_count", 0) or 0)
     opening_seed_section = ""
     _seed = (state.get("synopsis") or {}).get("opening_seed_text") or ""
     vol0 = int(state.get("current_volume_index", 0) or 0) == 0
-    if _seed.strip() and current_idx == 0 and not completed and vol0:
+    pp_open = state.get("path_progress") or {}
+    _v43_paths_done = (
+        bool(state.get("current_event_paths"))
+        and isinstance(pp_open, dict)
+        and bool((pp_open.get("completed_paths") or []))
+    )
+    if _seed.strip() and current_idx == 0 and gsec == 0 and vol0 and not _v43_paths_done:
         opening_seed_section = (
             "## 【已锁定开篇正文（最高优先级·本书固定开端）】\n\n"
             + _seed.strip()
@@ -249,24 +296,97 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
             "④ 最终输出 = 【上述开篇原文（一字不改地复制）】+【你写的续文】，两段合并为完整章节。\n\n"
         )
 
-    # 上一章结尾承接（非首章时注入，强制本章开头直接承接）
+    # 上一路径/片段结尾承接（事件流：取 cumulative_prose_tail）
     prev_chapter_section = ""
-    if completed:
-        prev_ending = completed[-1][-350:] if len(completed[-1]) >= 350 else completed[-1]
-        if prev_ending.strip():
-            prev_chapter_section = (
-                "## ⚠️ 上一章结尾（必须直接承接，不可跳过）\n\n"
-                f"上一章最后一段：\n{prev_ending}\n\n"
-                "【硬性约束】本章第一段必须直接承接上一章的场面："
-                "人物位置、场景、时间线必须连续。"
-                "禁止在没有任何交代的情况下切换到新地点或新场景。\n\n"
-            )
+    pp_w = state.get("path_progress") or {}
+    _tail = str((pp_w.get("cumulative_prose_tail") or "")).strip() if isinstance(pp_w, dict) else ""
+    if _tail:
+        prev_chapter_section = (
+            "## ⚠️ 上一段末句（必须直接承接）\n\n"
+            f"末段摘录：\n{_tail}\n\n"
+            "【硬性约束】须与上述 physically/情绪连续，禁止无交代跳场。\n\n"
+        )
 
     # 事件路径链（已由用户确认）→ 主要叙事导航
-    event_chain = state.get("pending_event_path_chain", [])
-    event_path_chain_text = "\n".join(
-        f"  {i + 1}. {step}" for i, step in enumerate(event_chain)
-    ) if event_chain else "  （无事件链，按场景设计自由发挥）"
+    event_paths_v43 = state.get("current_event_paths") or {}
+    paths_v43 = event_paths_v43.get("paths") if isinstance(event_paths_v43, dict) else None
+    path_relay_section = ""
+    if isinstance(paths_v43, list) and paths_v43:
+        pp_rw = state.get("path_progress") or {}
+        if isinstance(pp_rw, dict) and str(pp_rw.get("write_relay_context") or "").strip():
+            path_relay_section = str(pp_rw.get("write_relay_context")).strip() + "\n\n"
+        path_def = get_current_v43_path_def(state)
+        if path_def:
+            ev_nm = event_paths_v43.get("event_name", "")
+            gexit = (event_paths_v43.get("scene_exit") or "").strip()
+            rem = list(pp_rw.get("remaining_paths") or []) if isinstance(pp_rw, dict) else []
+            is_last = len(rem) == 1
+            ptn = (path_def.get("path_to_next") or "").strip()
+            scene_exit_hint = (
+                (gexit or ptn) if is_last else (ptn or gexit or "（见 path_to_next / 全章 scene_exit）")
+            )
+            prev_raw = pp_rw.get("last_path_state_extract") if isinstance(pp_rw, dict) else {}
+            prev_last = ""
+            if isinstance(prev_raw, dict):
+                p1 = prev_raw.get("1_physical_state")
+                if isinstance(p1, dict):
+                    prev_last = str(p1.get("last_sentence") or "").strip()
+            if not prev_last:
+                prev_last = "（首条路径：无前一路径末句；从当前场景切入）"
+            pov = (path_def.get("pov_character") or "").strip() or (
+                state.get("protagonist_name") or "主角"
+            )
+            pnm = (path_def.get("path_name") or path_def.get("moment_description") or "").strip()
+            nf = (path_def.get("narrative_function") or "").strip()
+            lines_v = [
+                f"（当前事件：{ev_nm}；补丁 G：本次只写下列**一条**路径，勿写其余路径）",
+                "",
+                PATCH_G_SINGLE_PATH_CHAIN_TEMPLATE.format(
+                    path_name=pnm or path_def.get("path_id", ""),
+                    narrative_function=nf,
+                    pov_character=pov,
+                    scene_exit=scene_exit_hint,
+                    previous_path_last_sentence=prev_last,
+                ),
+            ]
+            event_path_chain_text = "\n".join(lines_v)
+            word_count_band = PATCH_G_SINGLE_PATH_WORDCOUNT
+            multi_path_write_iron_rules = PATCH_G_SINGLE_PATH_IRON
+        else:
+            ev_nm = event_paths_v43.get("event_name", "")
+            lines_v = [
+                "在动笔前，读取 path_gen 给出的完整路径列表：",
+                f"（当前事件：{ev_nm}；共 {len(paths_v43)} 条路径）",
+                "",
+            ]
+            for i, p in enumerate(paths_v43, 1):
+                if not isinstance(p, dict):
+                    continue
+                pid = p.get("path_id", f"path_{i}")
+                pnm = p.get("path_name", "")
+                md = p.get("moment_description", "")
+                nf = p.get("narrative_function", "")
+                ptn = (p.get("path_to_next") or "").strip()
+                lines_v.append(f"  Path {i}. [{pid}] {pnm or md}")
+                if md and pnm:
+                    lines_v.append(f"      叙事时刻：{md}")
+                if nf:
+                    lines_v.append(f"      叙事功能：{nf}")
+                if ptn:
+                    lines_v.append(f"      本路径止点/过渡（path_to_next）：{ptn}")
+            gexit = (event_paths_v43.get("scene_exit") or "").strip()
+            if gexit:
+                lines_v.append(f"  【全章 scene_exit — 最后一拍后必须停在此处，禁止越界】\n      {gexit}")
+            event_path_chain_text = "\n".join(lines_v)
+            word_count_band = PATCH_F_WRITE_PATH_WORDCOUNT
+            multi_path_write_iron_rules = PATCH_F_WRITE_PATH_INTEGRITY_RULES
+    else:
+        event_chain = state.get("pending_event_path_chain", [])
+        event_path_chain_text = "\n".join(
+            f"  {i + 1}. {step}" for i, step in enumerate(event_chain)
+        ) if event_chain else "  （无事件链，按场景设计自由发挥）"
+        word_count_band = "**800～2000 字**（单章）。"
+        multi_path_write_iron_rules = "（当前非 v4.3 多路径合章：按事件路径链顺序展开即可。）"
 
     # ─── 首次出场人物检测（排除主角，主角在 world 后已建立）────────────────────
     key_characters = current_node.get("key_characters", [])
@@ -349,25 +469,32 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
         character_reaction_section = "\n\n".join(lines) + "\n\n"
     else:
         character_reaction_section = ""
-    
+
+    _nmem = build_narrative_memory_pov_section(state)
+    narrative_memory_pov_section = (_nmem + "\n\n") if _nmem.strip() else ""
+
     user_prompt = (
         protagonist_archive_section
         + platform_macro_section
         + ("\n\n" if platform_macro_section.strip() else "")
         + WRITE_USER_TEMPLATE.format(
+            path_relay_section=path_relay_section,
+            narrative_memory_pov_section=narrative_memory_pov_section,
             world_setting_section=_format_world_setting_section(world_setting),
             opening_seed_section=opening_seed_section,
             first_appearance_section=first_appearance_section,
             prev_chapter_section=prev_chapter_section,
             quest_filter_section=quest_filter_section,
-            node_name=node_name,
+            word_count_band=word_count_band,
+            multi_path_write_iron_rules=multi_path_write_iron_rules,
+        node_name=node_name,
             event_path_chain_text=event_path_chain_text,
             emotional_arc=expand2.get("emotional_arc", ""),
             key_dialogues_section=key_dialogues_section,
-            weight_description=weight_description,
-            writing_style=blueprint.get("layer2", {}).get("writing_style", ""),
-            writing_skills=blueprint.get("layer2", {}).get("writing_skills", ""),
-            foreshadow_plant_instructions=foreshadow_plant_instructions,
+        weight_description=weight_description,
+        writing_style=blueprint.get("layer2", {}).get("writing_style", ""),
+        writing_skills=blueprint.get("layer2", {}).get("writing_skills", ""),
+        foreshadow_plant_instructions=foreshadow_plant_instructions,
             violations_if_rewrite=violations_text,
             character_reaction_section=character_reaction_section,
             rewrite_feedback_section=rewrite_feedback_section,
@@ -395,6 +522,7 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
         + WRITE_SYSTEM.format(
             platform_style=platform_style_text,
             user_write_rules_section=user_write_rules_section,
+            platform_path_filter_section=get_platform_path_filter_block(platform),
         )
         + f"\n\n{LIVING_COMPANION_RULES}"
         + f"\n\n{POV_AND_CUTAWAY_RULES}"
@@ -402,6 +530,8 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
         + f"\n\n{DEEPNOVEL_LITERARY_CONSTITUTION}"
         + f"\n\n{ADVANCED_LITERARY_RULES}"
         + f"\n\n{VARIABLE_ELASTICITY_RULE_BLOCK}"
+        + "\n\n"
+        + era_lexicon_system_suffix(state)
         + prot_gender_hint
         + "\n"
     )
@@ -412,11 +542,13 @@ async def write_node(state: CreationState, writer: StreamWriter) -> dict:
     )
 
     # 开篇种子此前仅作 prompt 上下文；若不拼入正文，入库后读者看不到（无头尸首章）
+    # v4.3 多路径：仅首条路径拼开篇，后续路径只写本段续文
     if (
         _seed.strip()
         and current_idx == 0
-        and not completed
+        and gsec == 0
         and vol0
+        and not _v43_paths_done
     ):
         draft = _seed.strip() + "\n\n" + (draft or "").strip()
 

@@ -10,6 +10,7 @@ import aiosqlite
 from langgraph.types import interrupt, Command
 from schemas.state import CreationState
 from config import DB_PATH
+from utils.v42_flow import shallow_world_archive
 import logging
 
 logger = logging.getLogger(__name__)
@@ -50,16 +51,25 @@ async def human_review_world_node(state: CreationState) -> Command:
     if action == "approve":
         # 写入 DB
         await _save_world_setting_to_db(project_id, world_setting)
+        ws = world_setting if isinstance(world_setting, dict) else {}
+        ne = str(ws.get("narrative_era") or "").strip()
         return Command(
-            update={"world_setting_confirmed": True},
+            update={
+                "world_setting_confirmed": True,
+                "world_archive": shallow_world_archive(ws),
+                "narrative_era": ne or (state.get("narrative_era") or ""),
+            },
             goto="protagonist_card",
         )
     else:
-        # 带修改意见重新生成
+        # 大改时代/脑洞根：回到脑洞引擎重炼（意见写入 brainwave_regen_feedback）
         return Command(
             update={
                 "world_setting_confirmed": False,
-                "world_setting_feedback":  feedback,
+                "world_setting_feedback": "",
+                "world_setting": {},
+                "brainwave_regen_feedback": feedback,
+                "brainwave_approved": False,
             },
-            goto="world_build",
+            goto="idea_forge",
         )

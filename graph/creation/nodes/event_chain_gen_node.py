@@ -2,7 +2,7 @@
 event_chain_gen_node v4.3 — 单事件生成
 
 每次调用生成一个事件（通过三步命运编织引擎），输出写入 state.current_event；
-同时追加 completed_events_summary，更新 anchor_progress。
+同时追加 completed_events_summary，更新 milestone_progress。
 
 路由：→ human_review_event（人工模式）或 → path_gen（自动模式）。
 """
@@ -20,7 +20,12 @@ from prompts.creation.event_chain_gen import (
     EVENT_CHAIN_GEN_SYSTEM,
     EVENT_CHAIN_GEN_USER_TEMPLATE,
     format_completed_events_summary,
-    format_arc_anchors_for_event_gen,
+    format_milestones_for_event_gen,
+)
+from utils.volume_milestones import (
+    default_milestone_conditions_placeholder,
+    get_volume_milestones,
+    initialize_milestone_progress,
 )
 from utils.v42_flow import protagonist_archive_prompt_block
 
@@ -30,7 +35,7 @@ logger = logging.getLogger("deepnovel.event_chain_gen")
 # ─── 保留的辅助函数 ────────────────────────────────────────────────────────────
 
 def _karmic_ledger_prompt_block(state: CreationState) -> str:
-    """将 state 顶层或 bible 中的因果种子注入事件链 prompt。"""
+    """将 state 顶层或 bible 中的因果种子注入事件链 prompt；pending 且超账龄打急需回收标。"""
     raw = state.get("karmic_ledger")
     if not isinstance(raw, list) or not raw:
         bb = state.get("bible")
@@ -44,53 +49,62 @@ def _karmic_ledger_prompt_block(state: CreationState) -> str:
             return ""
     else:
         raw = list(raw)[-40:]
+
+    gsec = int(state.get("global_settled_event_count", 0) or 0)
+    n_summary = len(state.get("completed_events_summary") or [])
+    n_complete = max(gsec, n_summary)
+    stale_after = 15
+    tag = "[🚨 急需回收] "
+    decorated: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        d = dict(item)
+        st = str(d.get("status") or "pending").strip().lower()
+        if st != "pending":
+            decorated.append(d)
+            continue
+        planted = int(d.get("planted_at_node") or d.get("planted_at_seq") or 0)
+        age = max(0, n_complete - planted) if planted > 0 else 0
+        if age > stale_after:
+            for key in ("description", "surface_meaning", "surface_expression", "potential_trigger"):
+                v = d.get(key)
+                if isinstance(v, str) and v.strip() and tag not in v:
+                    d[key] = tag + v.strip()
+                    break
+        decorated.append(d)
+
     try:
-        blob = json.dumps(raw, ensure_ascii=False, indent=2)
+        blob = json.dumps(decorated, ensure_ascii=False, indent=2)
     except (TypeError, ValueError):
-        blob = str(raw)
+        blob = str(decorated)
     lim = 12000
     if len(blob) > lim:
         blob = blob[: lim - 20] + "\n…（截断）"
     return blob
 
 
-def _get_arc_anchors(volume: dict) -> list[dict]:
-    """从卷中提取 arc_anchors；旧卷不含时生成最小占位。"""
-    anchors = volume.get("arc_anchors")
-    if isinstance(anchors, list) and anchors:
-        out = []
-        for idx, a in enumerate(anchors):
-            if not isinstance(a, dict):
-                continue
-            if not a.get("anchor_id"):
-                a = dict(a)
-                a["anchor_id"] = idx + 1
-            out.append(a)
-        return out
-    return [
-        {
-            "anchor_id": 1,
-            "position": "early",
-            "milestone_type": "开篇碰撞",
-            "arrival_condition": "主角被卷入本卷核心冲突",
-            "completion_signal": "主角与核心冲突完成首次正面碰撞",
-        },
-        {
-            "anchor_id": 2,
-            "position": "mid",
-            "milestone_type": "规则反转",
-            "arrival_condition": "主角发现表面规则背后的真实博弈",
-            "completion_signal": "某关键信息被揭露或某势力关系发生实质性转变",
-        },
-        {
-            "anchor_id": 3,
-            "position": "late",
-            "milestone_type": "圈层跃迁",
-            "arrival_condition": "主角完成本卷核心目标，进入更高圈层",
-            "completion_signal": "主角获得新身份/资源/权柄或打破核心幻想",
-        },
-    ]
+def _get_volume_milestones_resolved(volume: dict) -> list[dict]:
+    """本卷 milestone_conditions；空则沙盒默认三里程碑。"""
+    m = get_volume_milestones(volume)
+    if m:
+        return m
+    return [dict(x) for x in default_milestone_conditions_placeholder()]
 
+
+def _coerce_milestone_id(milestones: list[dict], raw_id) -> str | None:
+    if raw_id is None:
+        return None
+    s = str(raw_id).strip()
+    if not s:
+        return None
+    for m in milestones:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("milestone_id") or "").strip()
+        if mid == s:
+            return mid
+    return None
 
 def _get_last_causal_output(state: CreationState) -> str:
     """从 state 中提取上一事件的因果输出，供下一事件生成时注入。"""
@@ -162,10 +176,38 @@ def _get_protagonist_archive_text(state: CreationState) -> str:
     return protagonist_archive_prompt_block(pa)
 
 
+def _scene_snapshot_prompt_section(state: CreationState) -> str:
+    """补丁 F §五：用户消息内注入 scene_snapshot（与系统提示「第零步」配套）。"""
+    snap = state.get("scene_snapshot") or {}
+    if not isinstance(snap, dict) or not snap:
+        return (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "（无上一章 scene_snapshot 数据）\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "尚无上一章快照（全书开篇或尚未经 narrative_extract / bible_update 落盘）。"
+            "请按系统提示：跳过第零步，从「第一步：World Tick」起算。\n\n"
+        )
+    try:
+        blob = json.dumps(snap, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        blob = str(snap)[:4000]
+    lim = 6000
+    if len(blob) > lim:
+        blob = blob[: lim - 20] + "\n…（截断）"
+    return (
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "上一章 scene_snapshot（第零步输入）\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "读取上一章的 scene_snapshot，这是本事件推演的绝对起点。\n\n"
+        f"{blob}\n\n"
+        "---\n\n"
+    )
+
+
 def _build_quest_stack_for_protagonist_tick(state: CreationState) -> str:
     """
     提取 active_quest_stack 中 critical/high 的活跃任务，
-    格式化为 Protagonist Tick 专用注入块（补丁 D）。
+    格式化为 Protagonist Tick 专用注入块（补丁 D + J 救护车比喻）。
     """
     qs = state.get("active_quest_stack") or []
     if not isinstance(qs, list):
@@ -181,9 +223,9 @@ def _build_quest_stack_for_protagonist_tick(state: CreationState) -> str:
         return ""
 
     lines = [
-        "## 【Protagonist Tick — 任务栈驱动（补丁D，优先于 core_desire 推导）】",
-        "以下任务的 current_sub_goal 直接构成主角此刻最深的需求，",
-        "无需重新从 core_desire 推导——任务栈已经是推导的结果。",
+        "## 【任务栈快照 — 仅作「救护车车道」参考（补丁 J）】",
+        "**critical** = 拉响警报时才可劫持主轴；**high** = 加塞，默认仍让 **independent_agenda 常规车道**为主，除非系统提示里「警报」条件已成立。",
+        "下列条目**不是**默认的最深需求；是否 `quest_driven` 由你在第二步按警报规则自判。",
         "",
     ]
     for q in active:
@@ -193,7 +235,7 @@ def _build_quest_stack_for_protagonist_tick(state: CreationState) -> str:
         lines.append(f"   quest_name: {q.get('quest_name', '')}")
         sg = (q.get("current_sub_goal") or "").strip()
         if sg:
-            lines.append(f"   current_sub_goal（= deepest_need）: {sg[:150]}")
+            lines.append(f"   current_sub_goal: {sg[:150]}")
         ew = (q.get("emotional_weight") or "").strip()
         if ew:
             lines.append(f"   emotional_weight: {ew[:120]}")
@@ -203,8 +245,8 @@ def _build_quest_stack_for_protagonist_tick(state: CreationState) -> str:
         lines.append("")
 
     lines.append(
-        "Protagonist Tick 输出须包含：quest_driven=true, driving_quest_id=（上方 quest_id），\n"
-        "deepest_need 直接引用 current_sub_goal，emotional_weight 引用任务的 emotional_weight。"
+        "若置 quest_driven=true：须在 protagonist_tick 写明满足了哪条「救护车警报」；\n"
+        "否则 quest_driven=false，driving_quest_id=null。"
     )
     return "\n".join(lines) + "\n"
 
@@ -238,6 +280,35 @@ def _should_include_character_for_relationship_tick(
     return False
 
 
+def _memory_streams_block_for_tick(card: dict) -> str:
+    """
+    将 independent_agenda 与叙事流窗口注入关系卡文本，供 World Tick 基于已有阅历推演。
+    （DB 侧已对 long/short 列表做尾部切片；此处再限制单行与总展示长度，防止用户模板膨胀。）
+    """
+    chunks: list[str] = []
+    agenda = (card.get("independent_agenda") or "").strip()
+    if agenda:
+        chunks.append(f"  独立议程: {agenda[:420]}")
+
+    st = card.get("short_term_stream") or []
+    if isinstance(st, list) and st:
+        lines = [str(x).strip() for x in st if str(x).strip()]
+        lines = lines[-6:]
+        body = "\n".join(f"    · {ln[:200]}" for ln in lines)
+        chunks.append(f"  short_term_stream（最近{len(lines)}条）:\n{body}")
+
+    lt = card.get("long_term_stream") or []
+    if isinstance(lt, list) and lt:
+        lines = [str(x).strip() for x in lt if str(x).strip()]
+        lines = lines[-10:]
+        body = "\n".join(f"    · {ln[:240]}" for ln in lines)
+        chunks.append(f"  long_term_stream（最近{len(lines)}条）:\n{body}")
+
+    if not chunks:
+        return ""
+    return "\n" + "\n".join(chunks)
+
+
 def _capabilities_snippet_for_tick(card: dict) -> str:
     """从配角卡 capabilities 摘一行供关系层与暗流对齐（无则省略）。"""
     caps = card.get("capabilities")
@@ -267,6 +338,7 @@ async def _get_entity_cards_text(project_id: str, vol_index: int) -> str:
     """
     从 entity_db 读取与主角存在强关系的角色卡，
     按 A类仇敌/B类恩情/C类潜在背叛 分类格式化为文本，供 World Tick 扫描维度二使用。
+    每张卡附带 independent_agenda 与 long_term_stream / short_term_stream 窗口（若有）。
     纳入规则与补丁文档一致：主阈值 60；40～59 仅在阈值透支/C 类性格/利益联盟等条件下纳入。
     """
     if not project_id:
@@ -306,6 +378,7 @@ async def _get_entity_cards_text(project_id: str, vol_index: int) -> str:
         current_state = (card.get("current_mental_state") or card.get("current_status") or "").strip()
         mental_growth = (card.get("mental_growth_path") or "").strip()
         cap_line = _capabilities_snippet_for_tick(card)
+        mem_block = _memory_streams_block_for_tick(card)
 
         base_info = (
             f"  姓名: {name}\n"
@@ -315,6 +388,7 @@ async def _get_entity_cards_text(project_id: str, vol_index: int) -> str:
             f"  当前状态: {current_state or '（未记录）'}\n"
             f"  心智成长路径: {mental_growth or '（未记录）'}"
             + (f"\n{cap_line}" if cap_line else "")
+            + mem_block
         )
 
         betrayal_traits = {"薄情寡恩", "见风使舵", "极度功利", "功利", "自私"}
@@ -466,45 +540,88 @@ def _determine_next_event_seq(state: CreationState, vol_index: int) -> int:
     return count + 1
 
 
-def _check_anchor_touched(event_result: dict, arc_anchors: list, anchor_progress: dict) -> tuple[str | None, dict]:
+def _evidence_suffices_milestone_claim(evidence: str) -> bool:
+    """非空、非敷衍占位，且达到一定长度，才允许自动结算里程碑。"""
+    e = (evidence or "").strip()
+    if len(e) < 24:
+        return False
+    lowered = e.lower()
+    placeholders = (
+        "尚在推进中",
+        "未满足",
+        "尚不满足",
+        "不满足",
+        "无证据",
+        "暂无",
+        "待完成",
+    )
+    if e in placeholders:
+        return False
+    if lowered in ("n/a", "na", "none", "null"):
+        return False
+    return True
+
+
+def _milestone_completion_accepted(ms: dict) -> bool:
     """
-    检查本事件是否触达某个锚点，返回 (touched_anchor_id, updated_anchor_progress)。
+    优先采用 is_trigger_state_fully_met；缺省则回退 milestone_completion_verified。
+    若输出中已出现新字段（is_trigger_state_fully_met 或 evidence_of_completion），
+    则 verified 时必须附带实质 evidence，防止讨好型虚假结算；否则保持旧契约（仅布尔）可用。
+    """
+    has_new = (
+        ms.get("is_trigger_state_fully_met") is not None
+        or "evidence_of_completion" in ms
+    )
+    if ms.get("is_trigger_state_fully_met") is not None:
+        verified = bool(ms.get("is_trigger_state_fully_met"))
+    else:
+        verified = bool(ms.get("milestone_completion_verified"))
+    if not verified:
+        return False
+    if not has_new:
+        return True
+    evidence = str(ms.get("evidence_of_completion") or "").strip()
+    return _evidence_suffices_milestone_claim(evidence)
+
+
+def _check_milestone_touched(
+    event_result: dict,
+    milestones: list[dict],
+    milestone_progress: dict,
+) -> tuple[str | None, dict]:
+    """
+    根据 milestone_check 更新进度。
+    返回 (本事件标记完成的 milestone_id, 更新后的 progress)。
     """
     if not isinstance(event_result, dict):
-        return None, anchor_progress
+        return None, milestone_progress
 
-    anchor_check = event_result.get("anchor_check") or {}
-    if not isinstance(anchor_check, dict):
-        return None, anchor_progress
+    ms = event_result.get("milestone_check")
+    if not isinstance(ms, dict):
+        return None, milestone_progress
+    raw_nearest = ms.get("nearest_pending_milestone_id")
 
-    arrival_met = anchor_check.get("arrival_condition_met", False)
-    completion_verified = anchor_check.get("completion_signal_verified", False)
-    nearest_id = anchor_check.get("nearest_pending_anchor_id")
+    if not _milestone_completion_accepted(ms):
+        return None, milestone_progress
 
-    if not arrival_met or not completion_verified:
-        return None, anchor_progress
-
-    # 更新 anchor_progress
-    updated = dict(anchor_progress) if isinstance(anchor_progress, dict) else {}
+    updated = dict(milestone_progress) if isinstance(milestone_progress, dict) else {}
     completed_list = list(updated.get("completed", []))
     pending_list = list(updated.get("pending", []))
 
-    if nearest_id is not None and nearest_id not in completed_list:
-        completed_list.append(nearest_id)
-        if nearest_id in pending_list:
-            pending_list.remove(nearest_id)
+    mid = _coerce_milestone_id(milestones, raw_nearest)
+    if mid is None and pending_list:
+        mid = str(pending_list[0])
+    if mid is None:
+        return None, updated
+
+    if str(mid) not in completed_list:
+        completed_list.append(str(mid))
+    if mid in pending_list:
+        pending_list.remove(mid)
 
     updated["completed"] = completed_list
     updated["pending"] = pending_list
-    return nearest_id, updated
-
-
-def _initialize_anchor_progress(arc_anchors: list, existing: dict | None) -> dict:
-    """如果 anchor_progress 尚未初始化，根据 arc_anchors 建立初始状态。"""
-    if existing and isinstance(existing, dict) and (existing.get("pending") or existing.get("completed")):
-        return existing
-    all_ids = [a.get("anchor_id") for a in arc_anchors if isinstance(a, dict)]
-    return {"completed": [], "pending": all_ids}
+    return mid, updated
 
 
 # ─── 主节点 ────────────────────────────────────────────────────────────────────
@@ -512,12 +629,12 @@ def _initialize_anchor_progress(arc_anchors: list, existing: dict | None) -> dic
 async def event_chain_gen_node(state: CreationState) -> Command:
     """
     v4.3 单事件生成节点：
-    1. 从 state 读取 anchor_progress（确定下一个待完成锚点）
+    1. 从 state 读取 milestone_progress（确定待完成里程碑）
     2. 从 state 读取 completed_events_summary（全局防重复）
     3. 从 state 读取上一个事件的 causal_output
-    4. 调用新提示词，输出单事件 JSON
-    5. 将新事件追加到 completed_events_summary
-    6. 更新 anchor_progress（若本事件触达锚点）
+    4. 调用提示词，输出单事件 JSON
+    5. 将摘要条目写入 current_event._settlement_summary_entry（bible_update 结算事件时 operator.add 至 completed_events_summary）
+    6. 更新 milestone_progress（若本事件判定完成某里程碑）
     7. 返回 Command(update={...}, goto="human_review_event")
     """
     project_id = state.get("project_id", "")
@@ -533,16 +650,14 @@ async def event_chain_gen_node(state: CreationState) -> Command:
         return Command(goto="human_review_batch")
 
     current_vol = volumes[vol_index]
-    arc_anchors = _get_arc_anchors(current_vol)
+    milestones = _get_volume_milestones_resolved(current_vol)
 
-    # 初始化 anchor_progress
-    anchor_progress = _initialize_anchor_progress(
-        arc_anchors, state.get("anchor_progress")
-    )
+    base_progress = dict(state.get("milestone_progress") or {})
+    milestone_progress = initialize_milestone_progress(milestones, base_progress)
 
-    # 确定待完成锚点列表和下一个锚点
-    pending_anchor_ids = anchor_progress.get("pending", [])
-    completed_anchor_ids = anchor_progress.get("completed", [])
+    # 确定待完成里程碑列表和已完成列表
+    pending_m_ids = milestone_progress.get("pending", [])
+    completed_m_ids = milestone_progress.get("completed", [])
 
     event_seq = _determine_next_event_seq(state, vol_index)
     event_id = f"ev_{vol_index + 1}_{event_seq:03d}"
@@ -557,7 +672,7 @@ async def event_chain_gen_node(state: CreationState) -> Command:
     protagonist_archive_text = _get_protagonist_archive_text(state)
     world_lexicon_active_text = await _get_world_lexicon_active_text(project_id, state)
     karmic_ledger_text = _karmic_ledger_prompt_block(state)
-    arc_anchors_text = format_arc_anchors_for_event_gen(arc_anchors, anchor_progress)
+    milestones_text = format_milestones_for_event_gen(milestones, milestone_progress)
     last_causal_output = _get_last_causal_output(state)
     completed_events_text = format_completed_events_summary(
         state.get("completed_events_summary") or []
@@ -567,16 +682,19 @@ async def event_chain_gen_node(state: CreationState) -> Command:
     # 补丁 D：任务栈驱动 Protagonist Tick
     quest_stack_section = _build_quest_stack_for_protagonist_tick(state)
 
+    scene_snapshot_section = _scene_snapshot_prompt_section(state)
+
     user_prompt = EVENT_CHAIN_GEN_USER_TEMPLATE.format(
+        scene_snapshot_section=scene_snapshot_section,
         quest_stack_section=quest_stack_section,
         world_archive=world_archive_text,
         entity_cards_block=entity_cards_block,
         protagonist_archive=protagonist_archive_text,
         world_lexicon_active=world_lexicon_active_text,
         karmic_ledger=karmic_ledger_text or "（无）",
-        arc_anchors=arc_anchors_text,
-        completed_anchors=json.dumps(completed_anchor_ids, ensure_ascii=False),
-        pending_anchors=json.dumps(pending_anchor_ids, ensure_ascii=False),
+        volume_milestones=milestones_text,
+        completed_milestones=json.dumps(completed_m_ids, ensure_ascii=False),
+        pending_milestones=json.dumps(pending_m_ids, ensure_ascii=False),
         last_causal_output=last_causal_output,
         completed_events_summary=completed_events_text,
         archive_writeback_snapshot=archive_writeback_snapshot,
@@ -600,32 +718,32 @@ async def event_chain_gen_node(state: CreationState) -> Command:
     raw["event_seq"] = event_seq
     raw["volume_index"] = vol_index
 
-    # 检查是否触达锚点并更新 anchor_progress
-    touched_anchor_id, updated_anchor_progress = _check_anchor_touched(
-        raw, arc_anchors, anchor_progress
+    # 检查是否完成里程碑并更新进度
+    touched_mid, updated_progress = _check_milestone_touched(
+        raw, milestones, milestone_progress
     )
 
-    if touched_anchor_id is not None:
-        node_step(f"事件链：锚点 {touched_anchor_id} 已触达，更新 anchor_progress")
+    if touched_mid is not None:
+        node_step(f"事件链：里程碑 {touched_mid} 已判定完成，更新 milestone_progress")
 
-    # 构建追加到 completed_events_summary 的摘要条目
+    cc = raw.get("causal_chain") if isinstance(raw.get("causal_chain"), dict) else {}
+    pt = raw.get("protagonist_tick") if isinstance(raw.get("protagonist_tick"), dict) else {}
     new_summary_entry = {
         "event_id": raw.get("event_id", event_id),
         "event_name": raw.get("event_name", "（未命名）"),
         "conflict_type": (raw.get("event_core") or {}).get("conflict_type", ""),
         "primary_resource_used": (raw.get("event_core") or {}).get("primary_resource_used", ""),
-        "anchor_touched": touched_anchor_id,
+        "event_result_type": str(cc.get("event_result_type") or "").strip(),
+        "protagonist_tick_type": str(pt.get("protagonist_tick_type") or "").strip(),
+        "milestone_touched": touched_mid,
     }
+    raw["_settlement_summary_entry"] = new_summary_entry
 
-    # 追加 completed_events_summary
-    existing_summary = list(state.get("completed_events_summary") or [])
-    updated_summary = existing_summary + [new_summary_entry]
-
-    post_pending = updated_anchor_progress.get("pending", [])
+    post_pending = updated_progress.get("pending", [])
     node_done(
         f"单事件生成完成：{raw.get('event_name', event_id)}"
-        + (f"（触达锚点 {touched_anchor_id}）" if touched_anchor_id else "")
-        + f"  待完成锚点→{post_pending}"
+        + (f"（完成里程碑 {touched_mid}）" if touched_mid else "")
+        + f"  待完成里程碑→{post_pending}"
     )
 
     # 根据是否为自动模式决定路由目标
@@ -636,8 +754,7 @@ async def event_chain_gen_node(state: CreationState) -> Command:
     return Command(
         update={
             "current_event": raw,
-            "completed_events_summary": updated_summary,
-            "anchor_progress": updated_anchor_progress,
+            "milestone_progress": updated_progress,
         },
         goto=goto_target,
     )

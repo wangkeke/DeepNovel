@@ -45,6 +45,7 @@ console = Console()
 NODE_DISPLAY_NAMES = {
     "load":                   "加载骨骼 / 续传检查",
     "idea_forge":             "解析创意脑洞与用户锚点",
+    "human_review_brainwave": "等待审核（脑洞锚点）",
     "genesis_ignition":       "生成开篇种子正文",
     "iceberg_deduction":      "冰山反推（世界快照 + 宏观构思）",
     "human_review_iceberg":   "等待审核（冰山反推）",
@@ -70,6 +71,8 @@ NODE_DISPLAY_NAMES = {
     "expand2":                "场景设计 + 事件链",
     "world_tick":             "三步命运编织（World Tick）",
     "protagonist_collision":  "三步命运编织（主角碰撞）",
+    "consistency":            "一致性（物理·路径·叙事）",
+    "auto_arc_transition":    "自动卷过渡",
     "tension_check":          "张力与逻辑质检",
     "auto_review":            "自动审稿（验骨 + 品味）",
     "write":                  "正文写作",
@@ -349,7 +352,6 @@ async def create_command(args):
         },
         "pivot_records": [],
         "post_pivot": False,
-        "completed_chapters": [],
         "creation_complete": False,
         "free_creation":            False,
         "resume_from_db":           False,
@@ -368,7 +370,10 @@ async def create_command(args):
         "creation_mode":            creation_mode or "auto",
         "story_direction_result":   {},
         "auto_mode":                False,
-        "max_chapters":             0,
+        "auto_target":              "book",
+        "volume_start_event_count": 0,
+        "global_settled_event_count": 0,
+        "max_auto_events":          0,
         "auto_retry_count":         0,
         "auto_retry_count_path":   0,
         "auto_retry_count_expand":  0,
@@ -392,6 +397,10 @@ async def create_command(args):
         "genre_dicts":              [],
         "user_raw_input":           user_raw_seed,
         "user_anchors":             {},
+        "brainwave_engine":         {},
+        "narrative_era":              "",
+        "brainwave_approved":         False,
+        "brainwave_regen_feedback":   "",
         "framework_file_path":      framework_file_path,
         "framework_parsed":         {},
         "volumes_draft":            [],
@@ -408,7 +417,7 @@ async def create_command(args):
         "current_event_paths":      {},
         "completed_events_summary": [],
         "recent_rhythm":            {},
-        "anchor_progress":          {},
+        "milestone_progress":       {},
         "path_progress":            {},
         "loop_control":             {},
         "arc_completion_summary":   {},
@@ -453,9 +462,7 @@ async def create_command(args):
                 console.print(
                     "[dim]检测到上次中断点，优先恢复确认步骤...[/dim]"
                 )
-                _interrupt_data = _pre_interrupts[0].value
-                _user_response = await _handle_interrupt(_interrupt_data)
-                input_data = Command(resume=_user_response)
+                input_data = await _command_resume_interrupts(_pre_interrupts)
         except Exception:
             pass  # checkpointer 读取失败时降级为正常 initial_state 流程
 
@@ -475,13 +482,10 @@ async def create_command(args):
             if not pending_interrupts:
                 break  # 没有 interrupt，正常完成
 
-            # 有 interrupt，取第一个处理
-            interrupt_data = pending_interrupts[0].value
-            user_response = await _handle_interrupt(interrupt_data)
-            input_data = Command(resume=user_response)
+            input_data = await _command_resume_interrupts(pending_interrupts)
 
         console.print("\n[bold green]✓ 创作完成！[/bold green]")
-        _print_creation_result(final_state, args)
+        await _print_creation_result(final_state, args)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]已中断，下次运行将自动从断点续传。[/yellow]")
@@ -500,6 +504,7 @@ async def _run_with_streaming(graph, input_data, config: dict) -> dict:
     遇到 interrupt 时 astream 迭代器自然终止。
     """
     from langchain_core.messages import AIMessageChunk
+    from utils.text_metrics import prose_char_count
 
     accumulated_state: dict = {}  # 跨节点累积关键 state 字段（用于 write 完成后读事件链）
 
@@ -595,7 +600,7 @@ async def _run_with_streaming(graph, input_data, config: dict) -> dict:
                     # pending_event_path_chain 由 expand2 设置，从累积 state 中读取
                     chain = accumulated_state.get("pending_event_path_chain", [])
                     console.print()
-                    console.print(f"  [green]✓[/green]  [dim]共 {len(draft)} 字[/dim]")
+                    console.print(f"  [green]✓[/green]  [dim]共 {prose_char_count(draft)} 字[/dim]")
                     if chain:
                         console.print()
                         console.rule("[dim]本章事件路径链（审核时可作为修改参考）[/dim]", style="dim")
@@ -626,11 +631,16 @@ async def _handle_interrupt(interrupt_data: dict) -> dict:
         console.print(interrupt_data.get("prompt", "请选择创作模式："))
         choice = input("\n请输入选项：").strip()
         if choice == "2":
-            max_ch = input("最大章节数（直接回车=不限制）：").strip()
-            max_chapters = int(max_ch) if max_ch.isdigit() else 0
-            console.print(f"[dim]自动模式已启动，最大章节数：{max_chapters or '不限制'}[/dim]")
-            return {"auto_mode": True, "max_chapters": max_chapters}
-        return {"auto_mode": False, "max_chapters": 0}
+            max_ev = input("最大已结算事件数后自动停笔（回车=不限制）：").strip()
+            max_auto_events = int(max_ev) if max_ev.isdigit() else 0
+            console.print(
+                f"[dim]自动模式：事件停笔上限 {max_auto_events or '不限制'}[/dim]"
+            )
+            return {
+                "auto_mode": True,
+                "max_auto_events": max_auto_events,
+            }
+        return {"auto_mode": False, "max_auto_events": 0}
 
     if prompt_type == "framework_review":
         content = interrupt_data.get("content", {})
@@ -662,15 +672,15 @@ async def _handle_interrupt(interrupt_data: dict) -> dict:
         event_id = content.get("event_id", "")
         event_summary = content.get("event_summary", "")
         collision = content.get("collision", {}) or {}
-        anchor_check = content.get("anchor_check", {}) or {}
-        global_check = content.get("global_context_check", {}) or {}
+        milestone_check = content.get("milestone_check", {}) or {}
+        chk_line = f"[bold]里程碑检查：[/bold]{milestone_check}\n" if milestone_check else ""
 
         console.print(Panel(
             f"[bold]事件：[/bold]{event_name}  [dim]({event_id})[/dim]\n\n"
             f"[bold]摘要：[/bold]{event_summary}\n\n"
             f"[bold]冲突面：[/bold]{collision.get('conflict_surface', '')}\n"
             f"[bold]反转点：[/bold]{collision.get('twist', '')}\n\n"
-            f"[bold]锚点检查：[/bold]{anchor_check}\n"
+            f"{chk_line}"
             f"[bold]全局一致性：[/bold]{global_check}",
             title="📌 单事件审核（v4.3）",
             border_style="cyan",
@@ -982,10 +992,23 @@ async def _handle_interrupt(interrupt_data: dict) -> dict:
         confirmed = edit_protagonist_card_interactive(card, console=console)
         return {"action": "approve", "confirmed_card": confirmed}
 
+    elif prompt_type == "brainwave_review":
+        console.print("\n[cyan][1][/cyan] 确认脑洞锚点与叙事时代，进入生成世界设定卡")
+        console.print(
+            "[cyan][2][/cyan] 调整 - 附上意见后将重新调用脑洞引擎，并再次回到本审核"
+        )
+        choice = input("\n请输入选项：").strip()
+        if choice == "1":
+            return {"action": "approve"}
+        feedback = input("请输入调整意见：").strip()
+        return {"action": "revise", "feedback": feedback}
+
     elif prompt_type == "world_review":
         # print_interrupt_prompt 已在顶部调用，直接从 content 里的 world_setting 渲染
         console.print("\n[cyan][1][/cyan] 确认，锁定世界设定，进入主角人物卡")
-        console.print("[cyan][2][/cyan] 修改 - 请附上修改意见（重新生成）")
+        console.print(
+            "[cyan][2][/cyan] 修改 - 附上意见后将回到脑洞引擎重炼锚点，再生成世界卡"
+        )
         choice = input("\n请输入选项：").strip()
         if choice == "1":
             return {"action": "approve"}
@@ -1230,25 +1253,46 @@ async def _handle_interrupt(interrupt_data: dict) -> dict:
     return {"action": "approve"}  # 默认通过
 
 
-def _print_creation_result(state: dict, args):
-    chapters = state.get("completed_chapters", [])
+async def _command_resume_interrupts(pending: list) -> Command:
+    """
+    LangGraph：存在多个 pending interrupt 时，必须用 resume={{interrupt_id: value}}，
+    不能再用单值 resume（否则会 RuntimeError）。
+    """
+    if not pending:
+        return Command(resume={})
+    if len(pending) == 1:
+        return Command(resume=await _handle_interrupt(pending[0].value))
+    resume_map: dict[str, object] = {}
+    for intr in pending:
+        resume_map[intr.id] = await _handle_interrupt(intr.value)
+    return Command(resume=resume_map)
+
+
+async def _print_creation_result(state: dict, args):
+    gsec = int(state.get("global_settled_event_count", 0) or 0)
     console.print(Panel(
         f"[green]✓ 创作完成[/green]\n\n"
-        f"完成章节：{len(chapters)} 节\n"
-        f"总字数：{sum(len(c) for c in chapters)} 字",
+        f"已结算事件：{gsec} 个",
         title="创作结果",
         border_style="green",
     ))
 
-    if chapters:
-        from config import NOVELS_DIR
-        bp_prefix = (args.blueprint_id or "deepnovel")[:8] or "deepnovel"
-        out_path = NOVELS_DIR / f"{bp_prefix}_{uuid.uuid4().hex[:6]}.txt"
-        out_path.write_text("\n\n---\n\n".join(chapters), encoding="utf-8")
-        console.print(f"\n[cyan]正文已保存到：[/cyan]{out_path}")
-
-        console.print("\n[bold cyan]第一章预览：[/bold cyan]")
-        console.print(chapters[0][:500] + ("..." if len(chapters[0]) > 500 else ""))
+    project_id = (state.get("project_id") or "").strip()
+    if project_id:
+        from memory.db import load_chapters
+        rows = await load_chapters(project_id)
+        if rows:
+            texts = [r.get("content") or "" for r in rows if r.get("content")]
+            total = sum(len(c) for c in texts)
+            console.print(f"[dim]DB 正文片段 {len(texts)} 条，总字数约 {total}[/dim]")
+            if texts:
+                from config import NOVELS_DIR
+                bp_prefix = (args.blueprint_id or "deepnovel")[:8] or "deepnovel"
+                out_path = NOVELS_DIR / f"{bp_prefix}_{uuid.uuid4().hex[:6]}.txt"
+                out_path.write_text("\n\n---\n\n".join(texts), encoding="utf-8")
+                console.print(f"\n[cyan]正文已导出到：[/cyan]{out_path}")
+                console.print("\n[bold cyan]首段预览：[/bold cyan]")
+                console.print(texts[0][:500] + ("..." if len(texts[0]) > 500 else ""))
 
 
 # ─── extract 命令 ─────────────────────────────────────────────────────────────
@@ -1383,10 +1427,10 @@ async def resume_command(args):
             return
 
         current_state = snapshot.values
-        completed = len(current_state.get("completed_chapters", []))
+        gsec = int(current_state.get("global_settled_event_count", 0) or 0)
         console.print(
             f"[cyan]恢复创作流，Thread ID: {args.thread_id}[/cyan]\n"
-            f"[dim]已完成章节：{completed} 节[/dim]"
+            f"[dim]已结算事件：{gsec} 个[/dim]"
         )
 
         if getattr(args, "next_batch", False):
@@ -1412,9 +1456,7 @@ async def resume_command(args):
 
             if pending_interrupts:
                 # 上次停在 interrupt 节点，先处理用户确认
-                interrupt_data = pending_interrupts[0].value
-                user_response = await _handle_interrupt(interrupt_data)
-                input_data = Command(resume=user_response)
+                input_data = await _command_resume_interrupts(pending_interrupts)
             else:
                 # 普通断点，直接恢复
                 input_data = None  # None = 从 checkpointer 恢复
@@ -1432,12 +1474,10 @@ async def resume_command(args):
                 if not pending_interrupts:
                     break
 
-                interrupt_data = pending_interrupts[0].value
-                user_response = await _handle_interrupt(interrupt_data)
-                input_data = Command(resume=user_response)
+                input_data = await _command_resume_interrupts(pending_interrupts)
 
             console.print("\n[bold green]✓ 创作完成！[/bold green]")
-            _print_creation_result(final_state, args)
+            await _print_creation_result(final_state, args)
 
         except KeyboardInterrupt:
             console.print("\n[yellow]已中断，下次运行将自动从断点续传。[/yellow]")

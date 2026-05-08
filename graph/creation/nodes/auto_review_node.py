@@ -9,8 +9,8 @@ auto_review_node：自动模式下替代所有人工确认节点。
 
 判断分级：
   直接通过（不调用 LLM）：
-    - batch 类型且未达 max_chapters → 直接继续下一批
-    - batch 类型且达到 max_chapters → 直接结束
+  - batch 类型且未达 max_auto_events（已结算事件）→ 直接继续下一批
+  - batch 类型且达到 max_auto_events → 直接结束
 
   LLM 判断（方向性决策）：
     - path：路径是否符合 synopsis 的核心冲突和走向
@@ -22,6 +22,7 @@ auto_review_node：自动模式下替代所有人工确认节点。
 """
 from __future__ import annotations
 import json
+import re
 from langgraph.types import Command
 from langgraph.graph import END
 from schemas.state import CreationState
@@ -34,7 +35,7 @@ from prompts.common.deepnovel_constitution import DEEPNOVEL_CONSTITUTION
 from memory.db import (
     get_entity_cards_by_names,
     load_chapters_count,
-    get_project_max_chapters,
+    get_project_max_auto_events,
     get_volumes,
 )
 from graph.creation.nodes.human_review_node import (
@@ -174,6 +175,23 @@ async def _review_path(state: CreationState, retry_count: int) -> Command:
     判断这批路径是否符合整体故事方向。
     数据来源：State（synopsis + story_path）
     """
+    # v4.3：路径在 current_event_paths，不由 story_path 承载；与人工点「满意」一致直接通过。
+    # 若仍走旧版 _format_path(story_path) 会得到 0 条，误判或浪费一次 LLM。
+    if state.get("current_event_paths"):
+        logger.info("[自动] v4.3 叙事路径已拆解，跳过旧版 story_path LLM 审核，进入路径落地")
+        next_expand = _expand1_retry_goto(state)
+        return Command(
+            update={
+                "path_approved": True,
+                "pending_review_type": "",
+                "auto_retry_count": 0,
+                "auto_retry_count_path": 0,
+                "auto_total_retry_count": 0,
+                "_auto_review_goto": next_expand,
+            },
+            goto=next_expand,
+        )
+
     synopsis = state.get("synopsis", {})
     story_path = state.get("story_path", [])
 
@@ -399,7 +417,12 @@ def _check_dialogue_ratio(draft: str) -> tuple[bool, str]:
     if not paragraphs:
         return True, ""
 
-    dialogue_markers = ["「", "」", '"', '"', "'", "'", '"', "'"]
+    dialogue_markers = [
+        "「", "」",
+        "\u201c", "\u201d",
+        "\u2018", "\u2019",
+        '"', "'",
+    ]
     dialogue_count = sum(
         1 for p in paragraphs
         if any(m in p for m in dialogue_markers)
@@ -477,6 +500,10 @@ async def _review_write(state: CreationState, retry_count: int) -> Command:
         if node_index < len(story_path)
         else ""
     )
+    if not node_name.strip() and state.get("current_event_paths"):
+        from utils.path_relay import v43_chapter_display_name
+
+        node_name = v43_chapter_display_name(state)
 
     event_path_chain = expand1.get("event_path_chain", [])
     chain_lines = "\n".join(
@@ -521,6 +548,12 @@ async def _review_write(state: CreationState, retry_count: int) -> Command:
     )
 
     result = await call_llm_json(AUTO_REVIEW_WRITE_SYSTEM, user_prompt)
+    if not isinstance(result, dict):
+        logger.warning(
+            "[自动] write 审核返回非 JSON 对象（%s），按不通过处理",
+            type(result).__name__,
+        )
+        result = {}
 
     bone_check = result.get("bone_check") if isinstance(result.get("bone_check"), dict) else {}
     issues = bone_check.get("issues") if isinstance(bone_check.get("issues"), list) else []
@@ -610,22 +643,25 @@ async def _review_batch(state: CreationState) -> Command:
     """
     批次完成后的自动决策。
     直接通过，不调用 LLM。
-    数据来源：数据库（chapters 数量 + max_chapters 配置）
+    停笔条件：已结算事件数 ≥ max_auto_events（state 或 DB novel_projects.max_chapters 列）。
     """
     project_id = state.get("project_id", "")
-    completed = await load_chapters_count(project_id)
-    max_chapters = state.get("max_chapters", 0) or await get_project_max_chapters(
+    cap = int(state.get("max_auto_events", 0) or 0) or await get_project_max_auto_events(
         project_id
     )
+    gsec = int(state.get("global_settled_event_count", 0) or 0)
 
-    if max_chapters > 0 and completed >= max_chapters:
-        logger.info(f"[自动] 已完成 {completed} 章，达到上限 {max_chapters}，结束创作")
+    if cap > 0 and gsec >= cap:
+        logger.info(
+            f"[自动] 已结算事件 {gsec} 个，达到上限 {cap}，结束创作"
+        )
         return Command(
             update={"creation_complete": True, "pending_review_type": "", "_auto_review_goto": "__end__"},
             goto=END,
         )
 
-    logger.info(f"[自动] 已完成 {completed} 章，继续规划下一批")
+    db_chapters = await load_chapters_count(project_id)
+    logger.info(f"[自动] DB 正文片段 {db_chapters} 条，继续下一批")
     batch_index = state.get("batch_index", 0)
     volumes = state.get("volumes") or []
     if not volumes and project_id:
@@ -649,6 +685,9 @@ async def _review_batch(state: CreationState) -> Command:
         base_update["current_event_chain"] = []
         base_update["current_event_chain_pos"] = 0
         base_update["last_event_batch_size"] = 0
+        base_update["volume_start_event_count"] = int(
+            state.get("global_settled_event_count", 0) or 0
+        )
         base_update["_auto_review_goto"] = "event_chain_gen"
         return Command(update=base_update, goto="event_chain_gen")
 

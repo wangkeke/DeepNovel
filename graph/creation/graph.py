@@ -3,7 +3,7 @@
 
 图结构：
 ```
-START → load ──┬── (新项目) v4.2：idea_forge → world_build → human_review_world → protagonist_card
+START → load ──┬── (新项目) v4.2：idea_forge → human_review_brainwave → world_build → human_review_world → protagonist_card
                │              → iceberg_deduction → human_review_iceberg → genesis_ignition
                │              → core_cast_gen → human_review_core_cast → story_arc_plan → …
                │              （开篇种子在冰山与人物/世界档案之后点燃；核心班底由 core_cast_gen 生成，配角由 bible_update 生长）
@@ -16,7 +16,7 @@ human_review_path(批准) / update_weight(未完) / load(续传) → world_tick 
 
 expand1 → human_review_expand（方向确认）
               ↓ 批准                ↓ 修改 → expand1
-          expand2 → write → tension_check → human_review_write（质量确认）
+          expand2 → write → consistency → tension_check → human_review_write（质量确认）
               ↑                    ↓ [1] 满意    → bible_update
               │                    ↓ [2] 文笔问题 → expand2（保持方向）
               └────────────────────↓ [3] 方向问题 → expand1
@@ -47,6 +47,7 @@ from graph.creation.nodes.human_review_node import (
 
 from graph.creation.nodes.world_build_node import world_build_node
 from graph.creation.nodes.human_review_world_node import human_review_world_node
+from graph.creation.nodes.human_review_brainwave_node import human_review_brainwave_node
 from graph.creation.nodes.protagonist_card_node import protagonist_card_node
 from graph.creation.nodes.human_review_expand_node import human_review_expand_node
 from graph.creation.nodes.human_review_write_node import human_review_write_node
@@ -55,12 +56,15 @@ from graph.creation.nodes.path_gen_node import path_gen_node, path_gen_v43_node
 from graph.creation.nodes.expand1_node import expand1_node, expand1_v43_node
 from graph.creation.nodes.expand2_node import expand2_node
 from graph.creation.nodes.write_node import write_node
+from graph.creation.nodes.path_state_extract_node import path_state_extract_node
 from graph.creation.nodes.bible_update_node import bible_update_node, _bible_update_v43_routing
+from graph.creation.nodes.auto_arc_transition_node import auto_arc_transition_node
 from graph.creation.nodes.update_weight_node import update_weight_node
 from graph.creation.nodes.human_review_batch_node import human_review_batch_node
 from graph.creation.nodes.auto_review_node import auto_review_node
 from graph.creation.nodes.mode_select_node import mode_select_node
 from graph.creation.nodes.tension_check_node import tension_check_node
+from graph.creation.nodes.consistency_node import consistency_node
 
 from graph.creation.nodes.human_review_story_arc_node import human_review_story_arc_node
 from graph.creation.nodes.story_arc_plan_node import story_arc_plan_node
@@ -80,7 +84,7 @@ def _route_after_load(state: CreationState) -> str:
     load 节点之后的路由：
       - 续传且有未完成路径 → expand1（直接继续写）
       - 续传但当前批次全完 → path_gen（规划下一批）
-      - 新项目             → idea_forge → world_build → … → genesis_ignition → story_arc_plan
+      - 新项目             → idea_forge → human_review_brainwave → world_build → … → genesis_ignition → story_arc_plan
     """
     if state.get("resume_from_db"):
         if state.get("story_path"):
@@ -135,6 +139,7 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
     builder.add_node("synopsis",                synopsis_node)
     builder.add_node("human_review_synopsis",   human_review_synopsis_node)
     builder.add_node("world_build",             world_build_node)
+    builder.add_node("human_review_brainwave",  human_review_brainwave_node)
     builder.add_node("human_review_world",      human_review_world_node)
     builder.add_node("protagonist_card",        protagonist_card_node)
     builder.add_node("path_gen",                path_gen_node)
@@ -143,13 +148,16 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
     builder.add_node("human_review_expand",     human_review_expand_node)
     builder.add_node("expand2",                 expand2_node)
     builder.add_node("write",                   write_node)
+    builder.add_node("path_state_extract",     path_state_extract_node)
     builder.add_node("human_review_write",      human_review_write_node)
     builder.add_node("bible_update",            bible_update_node)
+    builder.add_node("auto_arc_transition",    auto_arc_transition_node)
     builder.add_node("human_review_role_shift", human_review_role_shift_node)
     builder.add_node("update_weight",           update_weight_node)
     builder.add_node("human_review_batch",      human_review_batch_node)
     builder.add_node("auto_review",             auto_review_node)
     builder.add_node("mode_select",             mode_select_node)
+    builder.add_node("consistency",             consistency_node)
     builder.add_node("tension_check",           tension_check_node)
     builder.add_node("human_review_story_arc", human_review_story_arc_node)
     builder.add_node("story_arc_plan",          story_arc_plan_node)
@@ -198,7 +206,7 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
     # protagonist_collision 内部 Command(goto="expand1") — 不挂静态边，与 Command 叠加会双调度
 
     # ── legacy Synopsis 链（v4.2 新项目不走此路；仅保留供 human_review_synopsis_node 内部兜底循环） ──
-    # idea_forge 直接进 world_build，这两个节点在正常流程中永远不会被首次调度到
+    # idea_forge 由节点内 Command 进入 human_review_brainwave，勿叠静态出边
     builder.add_edge("synopsis", "human_review_synopsis")
 
     # synopsis 确认后 → world_build；拒绝 → 重新 synopsis
@@ -211,11 +219,13 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
     # world_build 生成后进入用户确认
     builder.add_edge("world_build", "human_review_world")
 
-    # 世界设定确认 → protagonist_card（主角人物卡）；修改 → 重新 world_build
+    # human_review_brainwave 仅由节点内 Command(goto=…) 出队（通过 → world_build；驳回 → idea_forge），勿叠条件边
+
+    # 世界设定确认 → protagonist_card（主角人物卡）；修改 → 回到脑洞引擎重炼
     builder.add_conditional_edges(
         "human_review_world",
-        lambda s: "protagonist_card" if s.get("world_setting_confirmed") else "world_build",
-        {"protagonist_card": "protagonist_card", "world_build": "world_build"},
+        lambda s: "protagonist_card" if s.get("world_setting_confirmed") else "idea_forge",
+        {"protagonist_card": "protagonist_card", "idea_forge": "idea_forge"},
     )
 
     # 主角人物卡：仅由 protagonist_card_node 的 Command(goto=…) 串联（自环 / → iceberg_deduction）。
@@ -298,8 +308,9 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
     )
 
     builder.add_edge("expand2", "write")
-    # write 完成后 → tension_check（逻辑+张力宽松质检，最多返工 2 次）→ human_review_write / auto_review / write
-    builder.add_edge("write", "tension_check")
+    # write → path_state_extract（补丁 H：五维接力）→ consistency（补丁 F）→ tension_check
+    builder.add_edge("write", "path_state_extract")
+    builder.add_edge("path_state_extract", "consistency")
     builder.add_conditional_edges(
         "tension_check",
         lambda s: s.get("_tension_goto", "human_review_write"),
@@ -355,6 +366,7 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
             "expand1_v43":             "expand1_v43",    # 内循环：下一路径
             "event_chain_gen":         "event_chain_gen",  # 外循环：下一事件
             "human_review_batch":      "human_review_batch",  # 卷收束
+            "auto_arc_transition":     "auto_arc_transition",  # 自动卷过渡（auto_mode+arc/book）
         },
     )
     builder.add_edge("human_review_role_shift", "update_weight")
@@ -402,6 +414,7 @@ async def build_creation_graph(db_path: str = "workspace/blueprints.db"):
             "human_review_path":   "human_review_path",
             "human_review_expand": "human_review_expand",
             "human_review_write":  "human_review_write",
+            "narrative_extract":   "narrative_extract",
             "bible_update":        "bible_update",
             "human_review_batch":  "human_review_batch",
             "__end__":             END,

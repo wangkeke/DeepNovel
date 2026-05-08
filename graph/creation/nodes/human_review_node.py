@@ -25,7 +25,7 @@ async def _upsert_project(
     synopsis: dict,
     platform_style: str = "通用网文",
     auto_mode: bool = False,
-    max_chapters: int = 0,
+    max_auto_events: int = 0,
 ) -> None:
     """synopsis 确认后，在 novel_projects 表中创建或更新项目记录"""
     async with aiosqlite.connect(str(DB_PATH)) as conn:
@@ -47,7 +47,7 @@ async def _upsert_project(
                 json.dumps(synopsis, ensure_ascii=False),
                 platform_style,
                 1 if auto_mode else 0,
-                max_chapters,
+                max_auto_events,
             ),
         )
         await conn.commit()

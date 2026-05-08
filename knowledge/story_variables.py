@@ -583,6 +583,143 @@ GENRE_CONSTRAINTS_AND_FLAVORS: dict[str, dict] = {
     },
 }
 
+# 脑洞引擎专用：与 GENRE_CONSTRAINTS_AND_FLAVORS 的键一一对应，供 build_genre_constraints_prompt_for_brainwave 注入。
+# 约束「高于」引擎内泛化示例；inferred_world_seeds / downstream 须与此自洽，禁止跨题材挪用。
+GENRE_BRAINWAVE_IRON: dict[str, dict] = {
+    "玄幻修仙": {
+        "core_elements": ["灵气修炼", "境界突破", "宗门势力", "法宝丹药", "道途竞争"],
+        "forbidden_crossover": ["现代科技主导", "现实主义职场", "考古学/盗墓"],
+        "flavor_note": "超自然力量是世界物理规则，不是异常",
+        "golden_finger_bias": "规则豁免类/信息降维类均适合",
+    },
+    "盗墓探险": {
+        "core_elements": ["古墓机关", "文物/宝藏", "民俗禁忌", "地下空间", "人性博弈", "历史谜题"],
+        "forbidden_crossover": [
+            "修仙境界体系",
+            "宗门/门派势力",
+            "灵气/道蕴等修炼资源",
+            "丹药/法宝等修仙道具",
+            "天道/天劫等超自然修炼概念",
+        ],
+        "flavor_note": "超自然元素必须根植于民俗/历史/考古，而非修仙体系",
+        "golden_finger_bias": "信息降维类（古籍知识/特殊感知）或凡人流类（极致胆识/专业技能）",
+        "hard_rule": "禁止引入任何修仙类设定。古墓中的机关是物理/化学机关，不是修仙阵法",
+    },
+    "重生穿越": {
+        "core_elements": ["先知优势", "历史/未来知识差", "身份落差", "蝴蝶效应"],
+        "forbidden_crossover": ["无明确时代背景的纯玄幻"],
+        "flavor_note": "先知信息是最大金手指，但必须有蝴蝶效应限制",
+        "golden_finger_bias": "信息降维类（重生先知）为主",
+    },
+    "都市职场": {
+        "core_elements": ["阶级壁垒", "职场规则", "资本博弈", "人际网络", "现代社会"],
+        "forbidden_crossover": ["修仙体系", "异能超能力（除非是特定超能都市设定）"],
+        "flavor_note": "爽点来自社会规则的精准利用，不来自超自然力量",
+        "golden_finger_bias": "凡人流类/信息降维类",
+    },
+    "古代权谋": {
+        "core_elements": ["宫廷倾轧", "派系博弈", "历史背景", "人性算计", "制度约束"],
+        "forbidden_crossover": ["现代价值观直接移植", "超自然修仙元素（除非是特定仙侠设定）"],
+        "flavor_note": "爽点来自在严苛规则下的精准博弈",
+        "golden_finger_bias": "凡人流类/人性博弈型",
+    },
+    "悬疑推理": {
+        "core_elements": ["信息不对称", "真相层层剥离", "心理博弈", "证据链"],
+        "forbidden_crossover": ["超自然力量直接解决谜题（除非是特定灵异悬疑设定）"],
+        "flavor_note": "每个谜底必须有逻辑支撑，不能靠金手指直接揭示",
+        "golden_finger_bias": "信息降维类（有限度）或纯凡人推理",
+    },
+    "末日科幻": {
+        "core_elements": ["生存资源争夺", "文明崩塌", "人性极限", "科技/变异"],
+        "forbidden_crossover": ["纯修仙体系"],
+        "flavor_note": "超自然元素必须有科学或伪科学解释框架",
+        "golden_finger_bias": "绝对资源类/规则豁免类",
+    },
+    "民国年代": {
+        "core_elements": ["历史背景", "时代洪流", "家国情怀", "文化碰撞"],
+        "forbidden_crossover": ["纯玄幻修仙体系"],
+        "flavor_note": "超自然元素若有，必须是民俗/传说层面，不是修仙体系",
+        "golden_finger_bias": "凡人流类/信息降维类",
+    },
+    "恐怖灵异": {
+        "core_elements": ["超自然威胁", "民俗禁忌", "心理恐惧", "规则破局"],
+        "forbidden_crossover": ["修仙境界体系"],
+        "flavor_note": "恐惧感来自未知和无力感，不是来自修炼变强",
+        "golden_finger_bias": "凡人流类或特定灵异感知能力",
+    },
+    "民间灵异": {
+        "core_elements": ["民间传说", "风俗禁忌", "地方志怪", "人情世故"],
+        "forbidden_crossover": ["系统化修仙体系", "宗门势力"],
+        "flavor_note": "灵异元素根植于具体地域文化，而非通用修仙规则",
+        "golden_finger_bias": "凡人流类/特定民俗传承",
+    },
+    "校园": {
+        "core_elements": ["青春成长", "校园规则", "同伴关系", "学业压力"],
+        "forbidden_crossover": ["成人职场规则直接移植", "修仙体系"],
+        "flavor_note": "爽点来自青春期特有的情感张力和成长突破",
+        "golden_finger_bias": "凡人流类",
+    },
+    "霸总": {
+        "core_elements": ["财富权力", "身份落差", "商业博弈", "情感拉扯"],
+        "forbidden_crossover": ["修仙体系", "末日设定"],
+        "flavor_note": "核心爽点是被强大且专情的人选择",
+        "golden_finger_bias": "绝对资源类/身份差型",
+    },
+    "生活伦理": {
+        "core_elements": ["当代家庭与伦理", "财产与代际矛盾", "情绪勒索", "一地鸡毛中的清醒反击"],
+        "forbidden_crossover": ["修仙体系", "玄幻宗门", "末日废土主导"],
+        "flavor_note": "张力来自关系与伦理、法制框架内的博弈，不靠超自然战力",
+        "golden_finger_bias": "信息降维类（重生/先知）须窄域，禁止死后全知式亲戚密谋",
+    },
+    "通用": {
+        "core_elements": ["以用户 genre_request 字面与已确认 synopsis 为先"],
+        "forbidden_crossover": ["无说明时套用另一题材的完整升级/宗门/盗墓或职场模板"],
+        "flavor_note": "未命中精确 bucket 时，禁止为爽感擅自换题材底盘。",
+        "golden_finger_bias": "与 fictional_hook 及用户锚点自洽即可",
+    },
+}
+
+
+def build_genre_constraints_prompt_for_brainwave(genre_request: str) -> str:
+    """
+    脑洞引擎 / world_build 滴灌用：按 map_genre_bucket 输出题材铁律块（中文）。
+    与 GENRE_CONSTRAINTS_AND_FLAVORS 同键；细节来自 GENRE_BRAINWAVE_IRON。
+    """
+    bucket = map_genre_bucket(genre_request or "")
+    iron = GENRE_BRAINWAVE_IRON.get(bucket) or GENRE_BRAINWAVE_IRON.get("通用") or {}
+    if not isinstance(iron, dict) or not iron:
+        gr = (genre_request or "").strip() or "（未指定）"
+        return f"## 【题材铁律：{gr}】\n（无扩展铁律表；请以用户题材字面常识约束，禁止跨题材挪用。）\n"
+
+    lines: list[str] = [f"## 【题材铁律：{bucket}】（以下约束高于引擎内泛化示例与脑洞自由发挥）\n"]
+    ce = iron.get("core_elements")
+    if isinstance(ce, list) and ce:
+        lines.append(f"[必须/尊重] 核心元素：{' / '.join(str(x) for x in ce if str(x).strip())}\n")
+    fc = iron.get("forbidden_crossover")
+    if isinstance(fc, list) and fc:
+        lines.append("[严禁] 跨题材混入：")
+        for item in fc:
+            s = str(item).strip()
+            if s:
+                lines.append(f"  - {s}")
+        lines.append("")
+    hr = iron.get("hard_rule")
+    if isinstance(hr, str) and hr.strip():
+        lines.append(f"[铁律] {hr.strip()}\n")
+    fn = iron.get("flavor_note")
+    if isinstance(fn, str) and fn.strip():
+        lines.append(f"[气质] {fn.strip()}\n")
+    gf = iron.get("golden_finger_bias")
+    if isinstance(gf, str) and gf.strip():
+        lines.append(f"[金手指倾向] {gf.strip()}\n")
+    cfg = get_genre_config(bucket)
+    flav = (cfg.get("flavor") or {}) if isinstance(cfg, dict) else {}
+    tab = str(flav.get("taboos") or "").strip()
+    if tab:
+        lines.append(f"[同档 taboos] {tab}\n")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 _EXACT_ALIAS_TO_CONFIG: dict[str, str] = {
     "家庭": "生活伦理",
     "婚礼": "生活伦理",

@@ -72,10 +72,10 @@ async def core_cast_gen_node(state: CreationState) -> Command:
 这些角色是全书骨干，不能随意替换。
 只返回 JSON，不加任何前言。
 
-【supreme_power（最高掌权者）】
-- `appears_from_volume` 仅表示**叙事侧重/读者感知权重**的参考卷次，**不是**「此前禁止同框或禁止正面出场」的法条。
-- `note` 必须写**动态博弈姿态**：可早同框、早碾压式擦过；**禁止**再写「前期只能被提及、不能正面登场」类死板隔离。
-- 出场与碰撞须遵守下文 **价码 ⇄ 刻意针对度**，与 `note` 描述一致。
+【沙盒特工铁律】
+- 你在向世界里投放**活生生的对手与盟友**，**禁止**写「第几章/第几卷才允许出场」类通告单。
+- 用 `independent_agenda` 写其**当前独立图谋**（后台在忙什么），用 `action_trigger` 写**与主角线发生硬碰撞的触发条件**（价码到线时自然入场）。
+- 碰撞须遵守下文 **价码 ⇄ 刻意针对度**；`note` 仍须写**动态博弈姿态**（可早同框、早碾压式擦过），与 `note` 描述一致。
 
 {FULL_OPPONENT_DOCTRINE}
 """,
@@ -106,7 +106,8 @@ async def core_cast_gen_node(state: CreationState) -> Command:
     "name": "最终宿敌的名字",
     "identity": "身份定位",
     "core_motivation": "为什么和主角产生终极冲突",
-    "appears_from_volume": 3,
+    "independent_agenda": "此人在世界后台的独立图谋（不要写第几章出场，只写其当前目的与资源动作）",
+    "action_trigger": "与主角线发生硬碰撞/认真针对的门槛条件（价码与针对度须可辩）",
     "human_logic": "马基雅维利逻辑 / 野心家逻辑 / 执念逻辑 / 复仇逻辑（选一个最匹配的）",
     "current_mental_state": "当前心智与成熟度（如：天真易内耗 / 极度理智果决）",
     "mental_growth_path": "全书心智升级轨迹",
@@ -114,14 +115,15 @@ async def core_cast_gen_node(state: CreationState) -> Command:
     "ebd_to_protagonist": -30,
     "ebd_bond_kind": "blood_feud",
     "ebd_type": "结构性敌对·尚未正面结仇",
-    "ebd_note": "出场情感坐标（非终态）；与 docs/EBD 文档一致"
+    "ebd_note": "情感坐标（非终态）；与 docs/EBD 文档一致"
   }},
   "lifelong_allies": [
     {{
       "name": "亲人或拟亲属名",
       "identity": "身份定位",
       "relationship": "与主角的亲缘/制衡关系",
-      "appears_from_volume": 0,
+      "independent_agenda": "在故事当下其独立推进的人生/家族/事业议程",
+      "action_trigger": "会迫使其与主角强绑或撕破脸的状态条件",
       "current_mental_state": "当前心智与成熟度",
       "mental_growth_path": "心智升级轨迹",
       "reverse_scale": "绝对逆鳞（无则填无）",
@@ -134,7 +136,8 @@ async def core_cast_gen_node(state: CreationState) -> Command:
       "name": "红颜或情感线角色名",
       "identity": "身份定位",
       "relationship": "单恋主角/双向/暧昧未明（写明）",
-      "appears_from_volume": 0,
+      "independent_agenda": "其个人当下最执着的目标或处境",
+      "action_trigger": "会迫使其在剧情中必须表态/站队/与主角对撞的条件",
       "current_mental_state": "当前心智与成熟度",
       "mental_growth_path": "心智升级轨迹",
       "reverse_scale": "绝对逆鳞（无则填无）",
@@ -148,7 +151,8 @@ async def core_cast_gen_node(state: CreationState) -> Command:
     "name": "最高掌权者名字",
     "identity": "身份定位",
     "stance_to_protagonist": "初始立场（漠视/中立/潜在助力）",
-    "appears_from_volume": 2,
+    "independent_agenda": "作为结构顶端的日常棋局与核心利益（不要写出场表）",
+    "action_trigger": "主角或局势触及何种红线时，会从「背景」转为「亲自介入或降维打击」",
     "note": "{_sp_note_example}",
     "ebd_to_protagonist": -10,
     "ebd_bond_kind": "contempt_instrumental",

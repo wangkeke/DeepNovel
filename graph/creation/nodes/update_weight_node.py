@@ -11,7 +11,7 @@ update_weight_node：骨骼权重动态更新节点
 长篇续写判断：
   - 当前批次节点全部写完（current_node_index >= len(story_path)）
   - 故事未标记完成（creation_complete=False）→ 触发下一批 path_gen
-  - 如果 story_path 为空或 completed_chapters 数量达到阈值 → 标记完成
+  - 如果 story_path 为空或创作已标记完成 → 不再触发 path_gen
 """
 from __future__ import annotations
 from langgraph.types import StreamWriter

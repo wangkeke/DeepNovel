@@ -18,8 +18,10 @@ from __future__ import annotations
 import logging
 from langgraph.types import interrupt, Command
 from schemas.state import CreationState
+from utils.path_relay import v43_chapter_display_name
 from memory.entity_db import append_learned_trait_interaction
 from utils.llm import call_llm_json
+from utils.text_metrics import prose_char_count
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,8 @@ async def human_review_write_node(state: CreationState) -> Command:
         if current_idx < len(story_path)
         else f"第{current_idx + 1}章"
     )
+    if state.get("current_event_paths") and (state.get("path_progress") or {}).get("paths_status"):
+        node_name = v43_chapter_display_name(state)
 
     pending_trait_updates = state.get("pending_trait_interaction_update", [])
 
@@ -94,7 +98,7 @@ async def human_review_write_node(state: CreationState) -> Command:
             "node_index":                     current_idx,
             "event_path_chain":               chain,
             "draft_preview":                  draft[:600] + ("…" if len(draft) > 600 else ""),
-            "word_count":                     len(draft),
+            "word_count":                     prose_char_count(draft),
             "pending_ability_checks":         pending_ability_checks,
             "pending_trait_interaction_update": pending_trait_updates,
             "pending_noun_foreshadows":       pending_noun_foreshadows,

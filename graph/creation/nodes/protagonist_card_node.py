@@ -22,6 +22,7 @@ from utils.llm import call_llm_json
 from memory.entity_db import upsert_entity_card
 from utils.v42_flow import shallow_protagonist_archive, shallow_world_archive
 from utils.protagonist_card_normalize import normalize_protagonist_card_for_state
+from utils.brainwave_engine import protagonist_card_brainwave_suffix
 import uuid as _uuid
 from config import DB_PATH
 import logging
@@ -268,17 +269,18 @@ async def protagonist_card_node(state: CreationState) -> Command:
     )
 
     # 第二步：根据印象 + world_archive + synopsis 生成人物卡
+    pc_user = PROTAGONIST_CARD_FROM_USER_TEMPLATE.format(
+        genre_request=genre_request,
+        platform_macro_hint=platform_macro_hint,
+        user_impression_section=user_impression_section,
+        world_archive_section=world_archive_section,
+        synopsis_text=synopsis_text,
+        feedback_section="",
+        logic_names_and_essences=get_logic_names_and_essences(),
+    ) + protagonist_card_brainwave_suffix(state)
     result = await call_llm_json(
         PROTAGONIST_CARD_FROM_USER_SYSTEM,
-        PROTAGONIST_CARD_FROM_USER_TEMPLATE.format(
-            genre_request=genre_request,
-            platform_macro_hint=platform_macro_hint,
-            user_impression_section=user_impression_section,
-            world_archive_section=world_archive_section,
-            synopsis_text=synopsis_text,
-            feedback_section="",
-            logic_names_and_essences=get_logic_names_and_essences(),
-        ),
+        pc_user,
     )
 
     card = result if isinstance(result, dict) else result.get("character_card", result)

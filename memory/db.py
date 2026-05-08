@@ -3,6 +3,7 @@
 伏笔 CRUD 函数。
 """
 from __future__ import annotations
+import hashlib
 import math
 import aiosqlite
 from pathlib import Path
@@ -18,14 +19,44 @@ SCHEMA_PATH = ROOT_DIR / "memory" / "schema.sql"
 async def save_foreshadow(project_id: str, entry: dict) -> None:
     """
     新增或更新一条伏笔。
-    以 (project_id, surface_meaning) 为唯一性依据，预写入与正式写入冲突时后者补全前者留空字段。
-    支持 mystery_type、is_backbone、ready_threshold（v2）。
+    表上同时存在 PRIMARY KEY(foreshadow_id) 与 UNIQUE(project_id, surface_meaning)；
+    单次 INSERT … ON CONFLICT 只能对应其中一个目标。先按 id 或 (project, surface) 删除再插入，避免重复写入抖动。
     """
     surf = entry.get("surface_meaning", "").strip()
     if not surf:
         return
+    fid = str(entry.get("foreshadow_id") or "").strip()
+    if not fid:
+        return
+    params = {
+        "foreshadow_id":       fid,
+        "project_id":          project_id,
+        "foreshadow_type":     entry.get("foreshadow_type", "event"),
+        "surface_meaning":     entry.get("surface_meaning", ""),
+        "true_meaning":        entry.get("true_meaning", ""),
+        "planted_at_node":     entry.get("planted_at_node", 0),
+        "collected_at_node":   entry.get("collected_at_node", 0),
+        "misdirect_direction": entry.get("misdirect_direction", ""),
+        "mentioned_by":       entry.get("mentioned_by", ""),
+        "story_potential":    entry.get("story_potential", ""),
+        "mystery_type":        entry.get("mystery_type", "normal"),
+        "is_backbone":        entry.get("is_backbone", 0),
+        "urgency":            entry.get("urgency", "latent"),
+        "mention_count":      entry.get("mention_count", 1),
+        "ready_threshold":    entry.get("ready_threshold", 3),
+        "is_inferred":        entry.get("is_inferred", 0),
+    }
     async with aiosqlite.connect(str(DB_PATH)) as conn:
         conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute(
+            """
+            DELETE FROM foreshadow_entries
+            WHERE foreshadow_id = ?
+               OR (project_id = ? AND surface_meaning = ?)
+            """,
+            (fid, project_id, surf),
+        )
         await conn.execute(
             """
             INSERT INTO foreshadow_entries (
@@ -43,44 +74,8 @@ async def save_foreshadow(project_id: str, entry: dict) -> None:
                 :story_potential, :mystery_type, :is_backbone,
                 :urgency, :mention_count, :ready_threshold, :is_inferred
             )
-            ON CONFLICT(project_id, surface_meaning) DO UPDATE SET
-                foreshadow_id       = excluded.foreshadow_id,
-                foreshadow_type     = excluded.foreshadow_type,
-                true_meaning        = CASE
-                    WHEN excluded.true_meaning != '' THEN excluded.true_meaning
-                    ELSE foreshadow_entries.true_meaning
-                END,
-                story_potential     = CASE
-                    WHEN excluded.story_potential != ''
-                    THEN excluded.story_potential
-                    ELSE foreshadow_entries.story_potential
-                END,
-                mystery_type        = excluded.mystery_type,
-                is_backbone         = excluded.is_backbone,
-                urgency             = excluded.urgency,
-                ready_threshold     = excluded.ready_threshold,
-                mention_count       = excluded.mention_count,
-                collected_at_node   = excluded.collected_at_node,
-                updated_at          = datetime('now')
             """,
-            {
-                "foreshadow_id":       entry.get("foreshadow_id", ""),
-                "project_id":          project_id,
-                "foreshadow_type":     entry.get("foreshadow_type", "event"),
-                "surface_meaning":     entry.get("surface_meaning", ""),
-                "true_meaning":        entry.get("true_meaning", ""),
-                "planted_at_node":     entry.get("planted_at_node", 0),
-                "collected_at_node":   entry.get("collected_at_node", 0),
-                "misdirect_direction": entry.get("misdirect_direction", ""),
-                "mentioned_by":       entry.get("mentioned_by", ""),
-                "story_potential":    entry.get("story_potential", ""),
-                "mystery_type":        entry.get("mystery_type", "normal"),
-                "is_backbone":        entry.get("is_backbone", 0),
-                "urgency":            entry.get("urgency", "latent"),
-                "mention_count":      entry.get("mention_count", 1),
-                "ready_threshold":    entry.get("ready_threshold", 3),
-                "is_inferred":        entry.get("is_inferred", 0),
-            },
+            params,
         )
         await conn.commit()
 
@@ -412,7 +407,7 @@ async def update_foreshadow_nature(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 章节加载（续传时注入 completed_chapters）
+# 章节加载（续传等）
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def load_chapters(project_id: str) -> list[dict]:
@@ -453,8 +448,8 @@ async def load_chapters_count(project_id: str) -> int:
         return 0
 
 
-async def get_project_max_chapters(project_id: str) -> int:
-    """从数据库读取最大章节数配置（自动模式用）"""
+async def get_project_max_auto_events(project_id: str) -> int:
+    """自动停笔上限（读 novel_projects.max_chapters 列，语义为 max_auto_events）。"""
     if not project_id:
         return 0
     try:
@@ -471,9 +466,9 @@ async def get_project_max_chapters(project_id: str) -> int:
 
 
 async def update_project_mode(
-    project_id: str, *, auto_mode: bool = False, max_chapters: int = 0
+    project_id: str, *, auto_mode: bool = False, max_auto_events: int = 0
 ) -> None:
-    """更新项目的创作模式（mode_select_node 用）"""
+    """更新项目的创作模式；max_auto_events 持久化在 max_chapters 列。"""
     if not project_id:
         return
     try:
@@ -482,7 +477,7 @@ async def update_project_mode(
                 """UPDATE novel_projects
                    SET auto_mode = ?, max_chapters = ?, updated_at = datetime('now')
                    WHERE project_id = ?""",
-                (1 if auto_mode else 0, max_chapters, project_id),
+                (1 if auto_mode else 0, max_auto_events, project_id),
             )
             await conn.commit()
     except Exception:
@@ -942,7 +937,10 @@ async def upsert_lexicon_entry(project_id: str, entry: dict) -> None:
     if not term or not project_id:
         return
 
-    lexicon_id  = (entry.get("lexicon_id") or f"LEX_{term[:8]}").strip()
+    # 主键 (lexicon_id, project_id) 必须稳定且按 term 唯一；勿采用 LLM 给的 lexicon_id，易与
+    # 前缀截断或其它词条撞车导致 UNIQUE(lexicon_id, project_id) 失败。
+    h = hashlib.sha256(f"{project_id}\0{term}".encode("utf-8")).hexdigest()[:24]
+    lexicon_id = f"LEX_{h}"
     term_type   = (entry.get("term_type") or "A").strip()
     category    = (entry.get("category") or "其他").strip()
     action      = (entry.get("action") or "new").strip()
@@ -974,6 +972,7 @@ async def upsert_lexicon_entry(project_id: str, entry: dict) -> None:
                    incomplete_clue_json, first_appearance_json)
                 VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(project_id, term) DO UPDATE SET
+                  lexicon_id                = excluded.lexicon_id,
                   term_type               = excluded.term_type,
                   category                = excluded.category,
                   static_profile_json     = excluded.static_profile_json,

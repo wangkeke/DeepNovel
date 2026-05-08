@@ -16,21 +16,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _volume_target_events(vol: dict) -> int:
+    if not isinstance(vol, dict):
+        return 30
+    try:
+        te = int(vol.get("target_events", 0) or 0)
+    except (TypeError, ValueError):
+        te = 0
+    if te > 0:
+        return max(1, te)
+    return 30
+
+
 async def human_review_batch_node(state: CreationState) -> Command:
-    completed  = state.get("completed_chapters", [])
     story_path = state.get("story_path", [])
     project_id = state.get("project_id", "")
     batch_index = state.get("batch_index", 0)
+    gsec = int(state.get("global_settled_event_count", 0) or 0)
+    vsec = int(state.get("volume_start_event_count", 0) or 0)
+    vol_events = max(0, gsec - vsec)
 
     batch_preview = "\n".join(
-        f"  {i + 1}. {node.get('node_name', f'节点{i+1}')}  "
-        f"（{len(completed[-(len(story_path)) + i]) if i < len(completed) else 0} 字）"
+        f"  {i + 1}. {node.get('node_name', f'节点{i + 1}')}"
         for i, node in enumerate(story_path)
     )
 
     status = await get_story_status(project_id) if project_id else {"permanent": [], "backbone": [], "pending": []}
 
-    # 框架导入：展示卷进度
     volumes = await get_volumes(project_id) if project_id else []
     current_vol_index = state.get("current_volume_index", 0)
     if volumes and current_vol_index < len(volumes):
@@ -39,15 +51,11 @@ async def human_review_batch_node(state: CreationState) -> Command:
         con = Console()
         con.print(
             f"\n[dim]当前进度：第{current_vol_index + 1}卷 / 共{len(volumes)}卷 "
-            f"「{current_vol.get('volume_name', '')}」[/dim]"
+            f"「{current_vol.get('volume_name', '')}」 本卷已结算事件 {vol_events}[/dim]"
         )
-        # 检查本卷是否已完成（总章节数达到本卷及之前各卷预估之和）
         completed_count = await load_chapters_count(project_id)
-        threshold = sum(
-            v.get("estimated_chapters", 0) or 0
-            for v in volumes[: current_vol_index + 1]
-        )
-        if threshold and completed_count >= threshold:
+        te = _volume_target_events(current_vol)
+        if te and vol_events >= te:
             await update_volume_progress(
                 project_id,
                 current_vol_index,
@@ -56,14 +64,15 @@ async def human_review_batch_node(state: CreationState) -> Command:
             )
             con.print(
                 f"[green]✓[/green]  第{current_vol_index + 1}卷"
-                f"「{current_vol.get('volume_name', '')}」已完成"
+                f"「{current_vol.get('volume_name', '')}」已达到本卷目标事件数"
             )
 
     user_input = interrupt({
         "type": "batch_review",
         "content": {
             "story_path":         story_path,
-            "completed_chapters": completed,
+            "global_settled_event_count": gsec,
+            "volume_event_count": vol_events,
             "batch_preview":      batch_preview,
             "project_id":         project_id,
             "story_status":       status,
@@ -97,6 +106,9 @@ async def human_review_batch_node(state: CreationState) -> Command:
             base_update["current_event_chain"] = []
             base_update["current_event_chain_pos"] = 0
             base_update["last_event_batch_size"] = 0
+            base_update["volume_start_event_count"] = int(
+                state.get("global_settled_event_count", 0) or 0
+            )
             return Command(update=base_update, goto="event_chain_gen")
 
         return Command(update=base_update, goto="path_gen")

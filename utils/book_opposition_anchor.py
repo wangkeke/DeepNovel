@@ -30,9 +30,25 @@ def book_opposition_prompt_block(
         lines.append(f"【核心冲突（补充）】：{core_conflict}")
 
     if uv_name:
-        appears = uv.get("appears_from_volume", 3)
-        lines.append(
-            f"具名顶格对手（班底卡，可选用）：{uv_name}（约从第 {appears} 卷起加重戏份；可早出场须符价码⇄刻意针对度）"
-        )
+        agenda = (uv.get("independent_agenda") or "").strip()
+        trig = (uv.get("action_trigger") or "").strip()
+        if agenda or trig:
+            tail = []
+            if agenda:
+                tail.append(f"独立议程：{agenda}")
+            if trig:
+                tail.append(f"下场/碰撞触发：{trig}")
+            lines.append(
+                "具名顶格对手（班底卡，可选用）："
+                + uv_name
+                + "（"
+                + "；".join(tail)
+                + "；早同框须符价码⇄刻意针对度）"
+            )
+        else:
+            lines.append(
+                f"具名顶格对手（班底卡，可选用）：{uv_name}"
+                "（碰撞时机由价码⇄刻意针对度与世界时钟驱动，勿写死出场卷）"
+            )
 
     return "\n".join(lines)

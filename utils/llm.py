@@ -17,6 +17,10 @@ LangGraph 的 astream_events 可自动捕获 token 级别的流式事件，
   LLM_PROVIDER=openai     → ChatOpenAI（官方 OpenAI）
 
 若输出**开头**含 <think>…</think>，call_llm / call_llm_json 会在进入正文或 JSON 解析前自动剥除。
+
+OpenAI 兼容接口若需要非标准体参数（如部分网关的 enable_thinking / enable_think），请设置环境变量
+  LLM_OPENAI_EXTRA_BODY='{"enable_thinking": true}'
+  （JSON 对象；将传入 ChatOpenAI 的 extra_body。官方 api.openai.com 不接受此类字段。）
 """
 from __future__ import annotations
 import asyncio
@@ -58,6 +62,26 @@ def _strip_leading_redacted_thinking(text: str) -> str:
         if not m:
             return t
         t = t[m.end() :]
+
+
+def _openai_extra_body_from_env() -> dict | None:
+    """
+    解析 LLM_OPENAI_EXTRA_BODY 为 extra_body 字典，供 OpenAI 兼容但扩展了请求体的网关使用。
+    键名以各服务商文档为准（如 enable_thinking、enable_think 等）。
+    """
+    raw = os.getenv("LLM_OPENAI_EXTRA_BODY", "").strip()
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning("LLM_OPENAI_EXTRA_BODY 不是合法 JSON，已忽略: %s", e)
+        return None
+    if not isinstance(obj, dict) or not obj:
+        if obj is not None:
+            logger.warning("LLM_OPENAI_EXTRA_BODY 须为非空 JSON 对象，已忽略")
+        return None
+    return obj
 
 
 def _default_max_tokens() -> int:
@@ -105,12 +129,16 @@ def get_llm(max_tokens: int = None):
             or os.getenv("DEEPSEEK_API_KEY", "")
         )
         base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/beta")
-        return ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            max_tokens=max_tokens,
-        )
+        extra = _openai_extra_body_from_env()
+        kwargs: dict = {
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "max_tokens": max_tokens,
+        }
+        if extra is not None:
+            kwargs["extra_body"] = extra
+        return ChatOpenAI(**kwargs)
 
 
 async def call_llm(system: str, user: str, retries: int = 3, max_tokens: int | None = None) -> str:

@@ -35,7 +35,7 @@ def _summarize_event(event: dict) -> dict:
             "narrative_purpose": event.get("event_core", {}).get("narrative_purpose", ""),
             "character_impact":  event.get("event_core", {}).get("character_impact", ""),
         },
-        "anchor_check": event.get("anchor_check", {}),
+        "milestone_check": event.get("milestone_check", {}),
         "global_context_check": event.get("global_context_check", {}),
     }
 

@@ -421,7 +421,7 @@ PATH_GEN_V43_SYSTEM = DEEPNOVEL_CONSTITUTION + "\n\n" + """你是一位**编剧*
 
 ## 核心职责
 接收一个「事件」（macro-level event）定义，将其拆解为**读者需要经历的若干关键时刻**（paths）。
-每个 path 对应约 1000～2500 字正文 / 一章节奏节拍。
+每个 path 对应一次后续 write 的正文节拍；**具体字数上下限以写作阶段用户消息中的「字数区间铁律」为准**。规划路径体量时可按约 **1000～2500 字/路径** 量级把握事件密度（高张力可偏上限，过渡/信息可偏下限），须与后续注入的字数铁律不矛盾。
 
 ## 编剧视角铁律
 **你的问题不是「角色做了什么」，而是「读者需要经历哪几个时刻」。**
@@ -449,6 +449,13 @@ PATH_GEN_V43_SYSTEM = DEEPNOVEL_CONSTITUTION + "\n\n" + """你是一位**编剧*
 - 从 `karmic_ledger` 中**自然嵌入**已有伏笔，不强塞
 - 每个事件最多嵌入 2 个伏笔节点，避免伏笔密度过高
 - 新伏笔（`is_new_foreshadow: true`）须言之有物，有具体的潜在引爆条件
+
+### 与 event_chain 的 `collision.intersect_type` 对齐
+若输入事件中 `collision.intersect_type` 为 **错位擦肩**，路径须体现未照面、信息差、迟到的发现或误读；若为 **单边推进**，须明确本事件以哪一条线为主轴、另一条线如何以缺席/扑空/后果渗透；**正面碰撞** 则允许强对峙与当场交锋。禁止无视该字段一律写成当面决战。
+
+### 与 `protagonist_tick` / `causal_chain.event_result_type` 对齐（补丁 J）
+- `protagonist_tick_type` 以 **A 主动委托 / B 主动调查** 为主时，路径应呈现「主角在营生或追线中撞上意外」，避免章章都是被动接招。
+- `event_result_type` = **A_closed** 时允许更多日常收束与阅历余韵路径；**B_fragment** 时须保留至少一条路径让读者感到「这事没这么简单」；**C_open** 时最后路径落下开放压力或新日程，勿所有路径都打成闭环胜仗。
 
 只返回 JSON，不加任何前言或说明文字。
 """
@@ -499,9 +506,10 @@ PATH_GEN_V43_USER_TEMPLATE = """\
         "foreshadow_content": "（若有）伏笔具体内容（来自 karmic_ledger 或新增）",
         "trigger_condition": "（若有）伏笔的潜在引爆条件"
       }},
-      "path_to_next": "本路径如何为下一路径铺垫（一句话因果描述）"
+      "path_to_next": "本路径如何为下一路径铺垫（一句话因果描述）；最后一条路径：写至本路径的 path_to_next 所描述的过渡点即止"
     }}
   ],
+  "scene_exit": "全章收束须落在此状态/开口（对应最后一拍之后不得再推进到下一事件；一句话）",
   "rhythm_note": "本事件整体节奏特征描述（须反映事件真实戏剧结构，而非功能排列）",
   "global_rhythm_adjustment": "基于 recent_rhythm 做了哪些节奏调整（若无调整填「无需调整」）"
 }}

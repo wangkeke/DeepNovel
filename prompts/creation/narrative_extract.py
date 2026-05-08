@@ -6,8 +6,8 @@ narrative_extract 节点提示词。
 
 NARRATIVE_EXTRACT_SYSTEM = """\
 你是一位资深编辑，刚刚读完了这一章的正文。
-你现在切换到分析者视角，做两件事：
-提取真正的伏笔，以及还原本章的叙事路径链。
+你现在切换到分析者视角，做四件事：
+提取真正的伏笔、还原本章的叙事路径链、词条识别与注册、以及本章末 Scene Snapshot。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 第一件事：伏笔提取（因果判断，不是名词扫描）
@@ -119,6 +119,59 @@ write 节点在执行过程中因真实档案状态而产生的有机漂移是�
 - update_dynamic：词条已有记录，本章产生了新的动态关联（追加，旧关联 is_active → false）
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第四件事：Scene Snapshot 提取
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+（与《DeepNovel v4.3 · 补丁文档 F》§三 原文一致）
+
+读取正文的最后一个场景，提取以下信息：
+
+1. 叙事时间戳
+   不是现实时间，而是故事内的相对时间描述
+
+2. 精确物理坐标
+   ⚠️ 必须精确到\"主角相对于周围物体的位置\"
+   不能是模糊的\"在矿洞里\"
+   必须是\"在洞口内侧约3步处，乱石堆后方蹲伏\"
+
+3. 当前姿态与物理状态
+   姿势/持有物品/伤情/精神状态简述
+
+4. 在场的其他角色
+   每个角色的精确位置、姿态、持有物、已知信息
+
+5. 已确认的场景资产（confirmed_assets_in_scene）
+   ⚠️ 只列入在本章正文中明确出现或描述的实体
+   未在正文中出现的，一律不列入
+   这个列表是下一事件的\"可用资产白名单\"
+
+6. 悬念状态评估
+   last_sentence：正文最后一句话（原文照录）
+   cliffhanger_level：high / medium / low
+   cliffhanger_nature：秒级生死 / 分钟级危机 / 章节级悬念
+   cliffhanger_description：一句话描述悬念的具体内容
+
+7. 空间约束声明
+   用一到三句话，明确声明对下一事件的空间约束
+   格式：\"[主角名]当前在[精确位置]，下一事件必须基于此继续\"
+
+8. 资产约束声明
+   用一到三句话，明确声明对下一事件的资产约束
+   格式：\"禁止引入[未确认资产]，敌人的[能力]只能使用[已确认资产]\"
+
+【输出格式】
+scene_snapshot 字段按上述结构完整输出，
+作为 bible_update 回写到全局 State 的强制字段。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+补丁 J · 与 event_chain 规划类型协同（摘要）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+用户消息可注入本事件的 `event_result_type`（A_closed / B_fragment / C_open）及 `protagonist_tick_type`。
+- **A_closed**：伏笔入库**克制**，忌把寻常人情细节都升格成「终局预兆」；阅历、人脉、小恩怨可如实记。
+- **B_fragment**：对正文中已出现的主线碎片、反常征兆，更积极地做**因果型**伏笔评估（仍须过三条件）。
+- **C_open**：路径链与 scene_snapshot 应体现处境被打开后的落点；叙事心理总结勿写成一切已Closure。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
 输出规范
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -134,6 +187,10 @@ NARRATIVE_EXTRACT_USER_TEMPLATE = """\
 
 {planned_paths}
 
+## 本事件规划语境（event_chain_gen · 补丁 J · 伏笔与路径倾角）
+
+{event_planning_context}
+
 ## 当前 karmic_ledger（已有伏笔，用于去重）
 
 {karmic_ledger_summary}
@@ -148,7 +205,7 @@ NARRATIVE_EXTRACT_USER_TEMPLATE = """\
 
 ---
 
-请以分析者视角读完上述正文，执行三件事：伏笔提取、路径链还原、词条识别。
+请以分析者视角读完上述正文，执行四件事：伏笔提取、路径链还原、词条识别、Scene Snapshot。
 
 返回 JSON：
 {{
@@ -196,5 +253,54 @@ NARRATIVE_EXTRACT_USER_TEMPLATE = """\
         "karmic_ledger_ref": "关联的伏笔 foreshadow_id（如该词条同时注册了伏笔）；无则填null"
       }}
     }}
-  ]
+  ],
+  "scene_snapshot": {{
+    "chapter_id": "与 global_seq 一致的章节标识（字符串）",
+    "narrative_timestamp": "故事内相对时间描述",
+
+    "location": {{
+      "macro": "宏观地点",
+      "micro": "精确物理位置（主角相对参照物）"
+    }},
+
+    "protagonist_state": {{
+      "posture": "姿态",
+      "physical_condition": "伤情/体能等",
+      "held_items": ["手持或身上明确出现的物件"],
+      "emotional_capacity_note": "精神阈值或压力简述（可填null）",
+      "awareness": "主角此刻已知的关键信息"
+    }},
+
+    "other_characters_present": [
+      {{
+        "character_id": "entity_cards 的 character_id，无则填null",
+        "name": "称呼或姓名",
+        "location": "相对精确位置",
+        "posture": "姿态",
+        "held_items": ["…"],
+        "awareness": "该角色此刻已知信息"
+      }}
+    ],
+
+    "confirmed_assets_in_scene": [
+      {{
+        "asset_name": "资产或群体名称",
+        "holder": "持有者或null",
+        "status": "激活中/驻守/暴露风险等",
+        "location": "在场景中的位置"
+      }}
+    ],
+
+    "last_sentence": "正文最后一句原文",
+    "cliffhanger_level": "high | medium | low",
+    "cliffhanger_nature": "秒级生死 | 分钟级危机 | 章节级悬念 之一",
+    "cliffhanger_description": "悬念一句话说明",
+
+    "spatial_constraints_for_next_event": [
+      "下一事件必须遵守的空间事实（禁止瞬移/错位）"
+    ],
+    "asset_constraints_for_next_event": [
+      "下一事件可用追踪手段/禁止凭空引入的资产类约束"
+    ]
+  }}
 }}"""
