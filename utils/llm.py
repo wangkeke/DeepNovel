@@ -1,7 +1,8 @@
 """
 统一 LLM 调用工具。
 
-优先使用调用方传入的 max_tokens，否则用环境变量 LLM_MAX_TOKENS，最后回退到 config.LLM_MAX_TOKENS。
+优先使用调用方传入的 max_tokens；call_llm_json 会将「非极小」的显式上限与全局 LLM_MAX_TOKENS 取较大值，
+避免思考模型先占满 completion 导致 JSON 为空。可用 LLM_JSON_STRICT_MAX=1 关闭该合并。
 
 对外提供两个函数：
   call_llm(system, user)       → str   用于 write_node（正文，纯文本）
@@ -85,7 +86,7 @@ def _openai_extra_body_from_env() -> dict | None:
 
 
 def _default_max_tokens() -> int:
-    """优先环境变量，否则用 config"""
+    """优先环境变量 LLM_MAX_TOKENS，否则用 config，最后回退 65536（与思考模型兼容）。"""
     env_val = os.getenv("LLM_MAX_TOKENS")
     if env_val:
         try:
@@ -96,7 +97,31 @@ def _default_max_tokens() -> int:
         from config import LLM_MAX_TOKENS
         return int(LLM_MAX_TOKENS)
     except ImportError:
-        return 8000
+        return 65536
+
+
+def _effective_json_max_tokens(requested: int | None) -> int:
+    """
+    JSON 调用的 completion 上限。
+    - None：使用全局默认（通常已设为较大值）。
+    - 显式值 ≤ LLM_JSON_TINY_OUTPUT_THRESHOLD（默认 256）：保持原值（短分类等）。
+    - 更大的显式值：与全局默认取 max，避免节点内写死的 1500/2000 在思考模型下先被推理占满。
+    LLM_JSON_STRICT_MAX=1：不做合并，始终使用调用方传入值（缺省仍走全局）。
+    """
+    strict = os.getenv("LLM_JSON_STRICT_MAX", "").strip().lower() in ("1", "true", "yes")
+    base = _default_max_tokens()
+    if requested is None:
+        return base
+    if strict:
+        return requested
+    try:
+        tiny = int(os.getenv("LLM_JSON_TINY_OUTPUT_THRESHOLD", "256"))
+    except ValueError:
+        tiny = 256
+    tiny = max(0, tiny)
+    if requested <= tiny:
+        return requested
+    return max(requested, base)
 
 
 def get_llm(max_tokens: int = None):
@@ -175,8 +200,13 @@ async def call_llm_json(
     自动清理 markdown 代码块包装（```json ... ```）。
     失败时指数退避重试；支持 json_repair；数组与对象均支持。
     """
-    effective_tokens = max_tokens or _default_max_tokens()
-    logger.debug(f"call_llm_json max_tokens={effective_tokens} (传入={max_tokens})")
+    effective_tokens = _effective_json_max_tokens(max_tokens)
+    logger.debug(
+        "call_llm_json max_tokens=%s (传入=%s, 全局默认=%s)",
+        effective_tokens,
+        max_tokens,
+        _default_max_tokens(),
+    )
     llm = get_llm(max_tokens=effective_tokens)
     messages = [SystemMessage(content=system), HumanMessage(content=user)]
 

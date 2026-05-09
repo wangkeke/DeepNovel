@@ -28,8 +28,12 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/beta"
 LLM_MODEL = "deepseek-chat"
 LLM_MODEL_WRITE = "deepseek-chat"
-LLM_MAX_TOKENS: int = int(os.environ.get("LLM_MAX_TOKENS", "8000"))
+# 默认拉高以便思考/推理模型：思维链与 JSON 共用 completion 预算时不易被截断为空。
+# 各服务商仍可能在服务端限制实际上限；可按网关文档在 .env 覆盖 LLM_MAX_TOKENS。
+LLM_MAX_TOKENS: int = int(os.environ.get("LLM_MAX_TOKENS", "65536"))
 LLM_MAX_RETRIES: int = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+# JSON 调用（utils.llm.call_llm_json）：显式 max_tokens 大于 LLM_JSON_TINY_OUTPUT_THRESHOLD（默认 256）
+# 时会与 LLM_MAX_TOKENS 取较大值，减轻思考链占满预算；需要严格沿用节点内数字时设 LLM_JSON_STRICT_MAX=1。
 
 # ─── utils/llm.py 使用的统一 LLM 环境变量 ────────────────────────────────────
 # 切换模型只需修改 .env，节点代码不变
@@ -40,7 +44,7 @@ LLM_MAX_RETRIES: int = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 #   LLM_API_KEY=sk-...           # 若未设置则回退到 DEEPSEEK_API_KEY
 #   LLM_BASE_URL=https://api.deepseek.com      # 标准 API，max_tokens 上限 4K
 #   LLM_BASE_URL=https://api.deepseek.com/beta # Beta API，max_tokens 可达 8K（默认）
-#   LLM_MAX_TOKENS=4000
+#   LLM_MAX_TOKENS=65536
 #   # 仅 OpenAI 兼容 Chat 接口：把网关扩展参数放进 extra_body（官方 OpenAI 不支持）
 #   # LLM_OPENAI_EXTRA_BODY={"enable_thinking": true}
 #
