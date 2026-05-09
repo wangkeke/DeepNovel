@@ -18,7 +18,7 @@ auto_review_node：自动模式下替代所有人工确认节点。
 
 异常处理：
   LLM 判断不通过 → 自动生成修改意见继续推进
-  连续2次不通过 → 通知用户介入，临时切回人工确认
+  连续多次不通过（见 MAX_AUTO_RETRY）→ 通知用户介入，临时切回人工确认
 """
 from __future__ import annotations
 import json
@@ -47,8 +47,10 @@ import logging
 
 logger = logging.getLogger("deepnovel.auto_review")
 
-MAX_AUTO_RETRY = 2
-MAX_TOTAL_RETRY = 5
+# 单一路径 / 扩写 / 正文自动审稿：连续 revise 达此次数后降级人工（原先 2 次过易打断长跑）。
+MAX_AUTO_RETRY = 10
+# 跨类型累计（path / expand / write 等共用 auto_total_retry_count），避免一章内多环节交替失败时早于单项上限耗尽。
+MAX_TOTAL_RETRY = 30
 
 
 def _expand1_retry_goto(state: CreationState) -> str:
