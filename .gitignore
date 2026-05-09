@@ -26,5 +26,5 @@ workspace/*
 !workspace/README.md
 *.zip
 pyproject.toml
-/logs/
 .cursor/
+logs/

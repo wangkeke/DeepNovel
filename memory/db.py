@@ -1194,6 +1194,6 @@ async def init_db() -> None:
                 await conn.execute(
                     f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]} {col_def[2]}"
                 )
-                await conn.commit()
+        await conn.commit()
             except Exception:
                 pass
