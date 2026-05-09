@@ -49,8 +49,10 @@ logger = logging.getLogger("deepnovel.auto_review")
 
 # 单一路径 / 扩写 / 正文自动审稿：连续 revise 达此次数后降级人工（原先 2 次过易打断长跑）。
 MAX_AUTO_RETRY = 10
-# 跨类型累计（path / expand / write 等共用 auto_total_retry_count），避免一章内多环节交替失败时早于单项上限耗尽。
-MAX_TOTAL_RETRY = 30
+# 跨类型累计（path / expand / write、对话占比打回等共用 auto_total_retry_count）。
+# 必须远大于单项上限：否则一章内「对话不合格多次 + expand 若干次 + write 若干次」会先触发全局阀，
+# 用户会看到正文人工面板，误以为是 MAX_AUTO_RETRY 不够。
+MAX_TOTAL_RETRY = max(400, MAX_AUTO_RETRY * 40)
 
 
 def _expand1_retry_goto(state: CreationState) -> str:
